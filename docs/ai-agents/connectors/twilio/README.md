@@ -40,7 +40,7 @@ The Twilio connector isn't currently able to handle prompts like these.
 ## Installation
 
 ```bash
-uv pip install airbyte-agent-twilio
+uv pip install airbyte-agent-sdk
 ```
 
 ## Usage
@@ -52,8 +52,8 @@ Connectors can run in open source or hosted mode.
 In open source mode, you provide API credentials directly to the connector.
 
 ```python
-from airbyte_agent_twilio import TwilioConnector
-from airbyte_agent_twilio.models import TwilioAuthConfig
+from airbyte_agent_sdk.connectors.twilio import TwilioConnector
+from airbyte_agent_sdk.connectors.twilio.models import TwilioAuthConfig
 
 connector = TwilioConnector(
     auth_config=TwilioAuthConfig(
@@ -76,11 +76,11 @@ If your Airbyte client can access multiple organizations, also set `organization
 This example assumes you've already authenticated your connector with Airbyte. See [Authentication](AUTH.md) to learn more about authenticating. If you need a step-by-step guide, see the [hosted execution tutorial](https://docs.airbyte.com/ai-agents/quickstarts/tutorial-hosted).
 
 ```python
-from airbyte_agent_twilio import TwilioConnector, AirbyteAuthConfig
+from airbyte_agent_sdk.connectors.twilio import TwilioConnector, AirbyteAuthConfig
 
 connector = TwilioConnector(
     auth_config=AirbyteAuthConfig(
-        customer_name="<your_customer_name>",
+        workspace_name="<your_workspace_name>",
         organization_id="<your_organization_id>",  # Optional for multi-org clients
         airbyte_client_id="<your-client-id>",
         airbyte_client_secret="<your-client-secret>"
@@ -101,17 +101,17 @@ This connector supports the following entities and actions. For more details, se
 
 | Entity | Actions |
 |--------|---------|
-| Accounts | [List](./REFERENCE.md#accounts-list), [Get](./REFERENCE.md#accounts-get), [Search](./REFERENCE.md#accounts-search) |
-| Calls | [List](./REFERENCE.md#calls-list), [Get](./REFERENCE.md#calls-get), [Search](./REFERENCE.md#calls-search) |
-| Messages | [List](./REFERENCE.md#messages-list), [Get](./REFERENCE.md#messages-get), [Search](./REFERENCE.md#messages-search) |
-| Incoming Phone Numbers | [List](./REFERENCE.md#incoming-phone-numbers-list), [Get](./REFERENCE.md#incoming-phone-numbers-get), [Search](./REFERENCE.md#incoming-phone-numbers-search) |
-| Recordings | [List](./REFERENCE.md#recordings-list), [Get](./REFERENCE.md#recordings-get), [Search](./REFERENCE.md#recordings-search) |
-| Conferences | [List](./REFERENCE.md#conferences-list), [Get](./REFERENCE.md#conferences-get), [Search](./REFERENCE.md#conferences-search) |
-| Usage Records | [List](./REFERENCE.md#usage-records-list), [Search](./REFERENCE.md#usage-records-search) |
-| Addresses | [List](./REFERENCE.md#addresses-list), [Get](./REFERENCE.md#addresses-get), [Search](./REFERENCE.md#addresses-search) |
-| Queues | [List](./REFERENCE.md#queues-list), [Get](./REFERENCE.md#queues-get), [Search](./REFERENCE.md#queues-search) |
-| Transcriptions | [List](./REFERENCE.md#transcriptions-list), [Get](./REFERENCE.md#transcriptions-get), [Search](./REFERENCE.md#transcriptions-search) |
-| Outgoing Caller Ids | [List](./REFERENCE.md#outgoing-caller-ids-list), [Get](./REFERENCE.md#outgoing-caller-ids-get), [Search](./REFERENCE.md#outgoing-caller-ids-search) |
+| Accounts | [List](./REFERENCE.md#accounts-list), [Get](./REFERENCE.md#accounts-get), [Context Store Search](./REFERENCE.md#accounts-context-store-search) |
+| Calls | [List](./REFERENCE.md#calls-list), [Get](./REFERENCE.md#calls-get), [Context Store Search](./REFERENCE.md#calls-context-store-search) |
+| Messages | [List](./REFERENCE.md#messages-list), [Get](./REFERENCE.md#messages-get), [Context Store Search](./REFERENCE.md#messages-context-store-search) |
+| Incoming Phone Numbers | [List](./REFERENCE.md#incoming-phone-numbers-list), [Get](./REFERENCE.md#incoming-phone-numbers-get), [Context Store Search](./REFERENCE.md#incoming-phone-numbers-context-store-search) |
+| Recordings | [List](./REFERENCE.md#recordings-list), [Get](./REFERENCE.md#recordings-get), [Context Store Search](./REFERENCE.md#recordings-context-store-search) |
+| Conferences | [List](./REFERENCE.md#conferences-list), [Get](./REFERENCE.md#conferences-get), [Context Store Search](./REFERENCE.md#conferences-context-store-search) |
+| Usage Records | [List](./REFERENCE.md#usage-records-list), [Context Store Search](./REFERENCE.md#usage-records-context-store-search) |
+| Addresses | [List](./REFERENCE.md#addresses-list), [Get](./REFERENCE.md#addresses-get), [Context Store Search](./REFERENCE.md#addresses-context-store-search) |
+| Queues | [List](./REFERENCE.md#queues-list), [Get](./REFERENCE.md#queues-get), [Context Store Search](./REFERENCE.md#queues-context-store-search) |
+| Transcriptions | [List](./REFERENCE.md#transcriptions-list), [Get](./REFERENCE.md#transcriptions-get), [Context Store Search](./REFERENCE.md#transcriptions-context-store-search) |
+| Outgoing Caller Ids | [List](./REFERENCE.md#outgoing-caller-ids-list), [Get](./REFERENCE.md#outgoing-caller-ids-get), [Context Store Search](./REFERENCE.md#outgoing-caller-ids-context-store-search) |
 
 
 ### Authentication
@@ -124,7 +124,7 @@ See the official [Twilio API reference](https://www.twilio.com/docs/usage/api).
 
 ## Version information
 
-- **Package version:** 0.1.9
-- **Connector version:** 1.0.2
-- **Generated with Connector SDK commit SHA:** 09ed4945e89bf743be8a0f0d596ae77c99526607
+- **Package version:** 1.0.4
+- **Connector version:** 1.0.4
+- **Generated with Connector SDK commit SHA:** unknown
 - **Changelog:** [View changelog](https://github.com/airbytehq/airbyte-agent-connectors/blob/main/connectors/twilio/CHANGELOG.md)

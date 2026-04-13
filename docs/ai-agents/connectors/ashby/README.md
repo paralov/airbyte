@@ -35,7 +35,7 @@ The Ashby connector isn't currently able to handle prompts like these.
 ## Installation
 
 ```bash
-uv pip install airbyte-agent-ashby
+uv pip install airbyte-agent-sdk
 ```
 
 ## Usage
@@ -47,8 +47,8 @@ Connectors can run in open source or hosted mode.
 In open source mode, you provide API credentials directly to the connector.
 
 ```python
-from airbyte_agent_ashby import AshbyConnector
-from airbyte_agent_ashby.models import AshbyAuthConfig
+from airbyte_agent_sdk.connectors.ashby import AshbyConnector
+from airbyte_agent_sdk.connectors.ashby.models import AshbyAuthConfig
 
 connector = AshbyConnector(
     auth_config=AshbyAuthConfig(
@@ -70,11 +70,11 @@ If your Airbyte client can access multiple organizations, also set `organization
 This example assumes you've already authenticated your connector with Airbyte. See [Authentication](AUTH.md) to learn more about authenticating. If you need a step-by-step guide, see the [hosted execution tutorial](https://docs.airbyte.com/ai-agents/quickstarts/tutorial-hosted).
 
 ```python
-from airbyte_agent_ashby import AshbyConnector, AirbyteAuthConfig
+from airbyte_agent_sdk.connectors.ashby import AshbyConnector, AirbyteAuthConfig
 
 connector = AshbyConnector(
     auth_config=AirbyteAuthConfig(
-        customer_name="<your_customer_name>",
+        workspace_name="<your_workspace_name>",
         organization_id="<your_organization_id>",  # Optional for multi-org clients
         airbyte_client_id="<your-client-id>",
         airbyte_client_secret="<your-client-secret>"
@@ -119,7 +119,7 @@ See the official [Ashby API reference](https://developers.ashbyhq.com/reference)
 
 ## Version information
 
-- **Package version:** 0.1.22
-- **Connector version:** 0.1.3
-- **Generated with Connector SDK commit SHA:** 75f388847745be753ab20224c66697e1d4a84347
+- **Package version:** 0.1.4
+- **Connector version:** 0.1.4
+- **Generated with Connector SDK commit SHA:** unknown
 - **Changelog:** [View changelog](https://github.com/airbytehq/airbyte-agent-connectors/blob/main/connectors/ashby/CHANGELOG.md)

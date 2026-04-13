@@ -50,7 +50,7 @@ The Clickup-Api connector isn't currently able to handle prompts like these.
 ## Installation
 
 ```bash
-uv pip install airbyte-agent-clickup-api
+uv pip install airbyte-agent-sdk
 ```
 
 ## Usage
@@ -62,8 +62,8 @@ Connectors can run in open source or hosted mode.
 In open source mode, you provide API credentials directly to the connector.
 
 ```python
-from airbyte_agent_clickup_api import ClickupApiConnector
-from airbyte_agent_clickup_api.models import ClickupApiAuthConfig
+from airbyte_agent_sdk.connectors.clickup_api import ClickupApiConnector
+from airbyte_agent_sdk.connectors.clickup_api.models import ClickupApiAuthConfig
 
 connector = ClickupApiConnector(
     auth_config=ClickupApiAuthConfig(
@@ -85,11 +85,11 @@ If your Airbyte client can access multiple organizations, also set `organization
 This example assumes you've already authenticated your connector with Airbyte. See [Authentication](AUTH.md) to learn more about authenticating. If you need a step-by-step guide, see the [hosted execution tutorial](https://docs.airbyte.com/ai-agents/quickstarts/tutorial-hosted).
 
 ```python
-from airbyte_agent_clickup_api import ClickupApiConnector, AirbyteAuthConfig
+from airbyte_agent_sdk.connectors.clickup_api import ClickupApiConnector, AirbyteAuthConfig
 
 connector = ClickupApiConnector(
     auth_config=AirbyteAuthConfig(
-        customer_name="<your_customer_name>",
+        workspace_name="<your_workspace_name>",
         organization_id="<your_organization_id>",  # Optional for multi-org clients
         airbyte_client_id="<your-client-id>",
         airbyte_client_secret="<your-client-secret>"
@@ -135,7 +135,7 @@ See the official [Clickup-Api API reference](https://developer.clickup.com/refer
 
 ## Version information
 
-- **Package version:** 0.1.9
-- **Connector version:** 0.1.3
-- **Generated with Connector SDK commit SHA:** 09ed4945e89bf743be8a0f0d596ae77c99526607
+- **Package version:** 0.1.5
+- **Connector version:** 0.1.5
+- **Generated with Connector SDK commit SHA:** unknown
 - **Changelog:** [View changelog](https://github.com/airbytehq/airbyte-agent-connectors/blob/main/connectors/clickup-api/CHANGELOG.md)
