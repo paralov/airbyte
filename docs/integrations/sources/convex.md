@@ -75,6 +75,7 @@ In the Data tab, you should see the tables and a sample of the data that will be
 
 | Version | Date       | Pull Request                                             | Subject                                                          |
 | :------ | :--------- | :------------------------------------------------------- | :--------------------------------------------------------------- |
+| 0.5.0-paralov.1 | 2026-04-25 | [76280](https://github.com/airbytehq/airbyte/pull/76280) | Add support for Convex components (Paralov internal build) |
 | 0.4.51 | 2025-10-07 | [65777](https://github.com/airbytehq/airbyte/pull/65777) | Update dependencies |
 | 0.4.50 | 2025-08-23 | [65287](https://github.com/airbytehq/airbyte/pull/65287) | Update dependencies |
 | 0.4.49 | 2025-08-16 | [65003](https://github.com/airbytehq/airbyte/pull/65003) | Update dependencies |
