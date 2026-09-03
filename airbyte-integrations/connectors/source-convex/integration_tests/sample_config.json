@@ -1,4 +1,5 @@
 {
-  "deployment_url": "https://descriptive-vulture-260.convex.cloud",
-  "access_key": "Your access token"
+  "deployment_url": "https://murky-swan-635.convex.cloud",
+  "access_key": "prod:murky-swan-635|deploy-key",
+  "schema_source": { "type": "api" }
 }

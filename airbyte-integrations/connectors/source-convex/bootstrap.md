@@ -3,16 +3,18 @@
 ## Overview
 
 Convex is the reactive backend-as-a-service for web developers.
-As part of the backend, Convex stores developer-defined documents in tables.
-Convex's HTTP API allows a developer to retrieve documents from their Convex tables.
+As part of the backend, Convex stores developer-defined documents in tables, both in the
+root of an app and inside installed [components](https://docs.convex.dev/components).
 
 ## Endpoints
 
-Convex defines three endpoints used for extracting data:
+The connector uses the [Convex Deployment API](https://docs.convex.dev/deployment-api/overview):
 
-1. `/json_schema` identifies the data format for each table.
-2. `/list_snapshot` returns pages of a table's data at a snapshot timestamp, for initial sync.
-3. `/document_deltas` returns pages of modifications to a table's data after a given timestamp.
+1. `POST /api/v1/data/sync` streams a resumable export of every selected table. Each page carries
+   `truncates` (tables to drop), `values` (document upserts and tombstones, each tagged with its
+   component path and table), a `status`, and an opaque `nextCursor`. One cursor covers all tables.
+2. `GET /api/v1/data/list_active_syncs` is used as the connection check.
+3. `GET /api/json_schemas` supplies table schemas when no inline schema is configured. It only knows
+   about root tables, so component tables need the inline schema option.
 
-For more details, see the documentation for Convex Sync endpoints at
-[https://docs.convex.dev/http-api/#sync](https://docs.convex.dev/http-api/#sync).
+See [https://docs.convex.dev/deployment-api/data-sync](https://docs.convex.dev/deployment-api/data-sync).

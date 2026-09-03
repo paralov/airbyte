@@ -7,27 +7,61 @@ See your data on the [Convex dashboard](https://dashboard.convex.dev/).
 
 ## Overview
 
-The Convex source connector supports Full Refresh, Incremental Append, and Incremental Dedupe with deletes.
+The Convex source connector streams documents out of a Convex deployment with the
+[Data Sync API](https://docs.convex.dev/deployment-api/data-sync). It supports Full Refresh,
+Incremental Append, and Incremental Dedupe with deletes, and it syncs tables that live inside
+installed [Convex components](https://docs.convex.dev/components) as well as tables in the app itself.
 
 ### Output schema
 
-This source syncs each Convex table as a separate stream.
-Check out the list of your tables on the [Convex dashboard](https://dashboard.convex.dev/) in the "Data" view.
+Every Convex table becomes one Airbyte stream:
 
-Types not directly supported by JSON are encoded as described in the
-[JSONSchema](https://json-schema.org/understanding-json-schema/reference/index.html)
-for the stream.
+- Tables in the root of the app keep their name, for example `messages`.
+- Tables inside a component are named `<component path>__<table>`, with `/` in nested component
+  paths replaced by `__`. For example `betterAuth__user` or `resend__emailWorkpool__payload`.
 
-For example, the Javascript value `new Set(["a", "b"])` is encoded as `{"$set": ["a", "b"]}`, as described by the JSONSchema
-`{"type": "object", "description": "Set", "properties": {"$set": {"type": "array", "items": {"type": "string"}}}}`.
-
-Every record includes the client-defined fields for the table, for example a `"messages"` table may contain fields for `"author"` and `"body"`.
-Additionally, each document has system fields:
+Every record includes the fields defined for the table plus these system fields:
 
 1. `_id` uniquely identifies the document. It is not changed by `.patch` or `.replace` operations.
-2. `_creationTime` records a timestamp in milliseconds when the document was initially created. It is not changed by `.patch` or `.replace` operations.
-3. `_ts` records a timestamp in nanoseconds when the document was last modified. It can be used for ordering operations in Incremental Append mode, and is automatically used in Incremental Dedupe mode.
-4. `_deleted` identifies whether the document was deleted. It can be used to filter deleted documents in Incremental Append mode, and is automatically used to remove documents in Incremental Dedupe mode.
+2. `_creationTime` records a timestamp in milliseconds when the document was initially created.
+3. `_ts` records the database timestamp in nanoseconds when this revision was written. It is the cursor.
+4. `_deleted` is `true` for tombstones. Deleted documents only carry `_id` and the system fields.
+5. `_component` and `_table` record where the document came from.
+6. `_ab_cdc_lsn`, `_ab_cdc_updated_at`, and `_ab_cdc_deleted_at` follow the CDC convention used by
+   database sources so destinations dedupe and delete consistently.
+
+Values that JSON cannot represent are encoded as described in the
+[Convex JSON format](https://docs.convex.dev/database/types), for example an int64 becomes
+`{"$integer": "<base64>"}`.
+
+### Table schemas
+
+Airbyte needs a JSON Schema for each stream. The connector can get it two ways, chosen with the
+"Table Schemas" option:
+
+- **Fetch from deployment** asks the deployment for its schemas. This only describes tables in the
+  root component; tables inside components are not discovered.
+- **Inline JSON** takes a JSON object of the form `{"<component path>": {"<table>": <JSON Schema>}}`,
+  with `""` as the root component path. Use this to sync component tables. You can generate the
+  object from your `convex.config.ts` and each component's `schema.ts` with a small script that reads
+  every table validator's `.json` representation and converts it to JSON Schema.
+
+### State and sync behaviour
+
+One Convex data sync covers every selected table, so there is a single Convex cursor. The connector
+stores that same cursor in every stream's state at each checkpoint and resumes from the most recent
+one. Consequences:
+
+- Enabling a new stream makes Convex sync that table from scratch; nothing else is re-sent.
+- A Full Refresh stream is deselected for one page and reselected, which makes Convex re-send it
+  in full. Other streams keep streaming changes.
+- The cursor expires after 3 days without a sync. The connector then restarts from scratch and
+  re-sends everything; Incremental Dedupe destinations absorb this.
+- If Convex truncates a table (for example after `npx convex import --replace`), the connector logs
+  a warning and the table is re-sent in full. Rows deleted by the truncate are not tombstoned, so
+  reset that stream in the destination if you need an exact mirror.
+- A sync stops when Convex reports the export is up to date and a page carries no changes. Set
+  "Max Pages Per Sync" to bound very large initial syncs; the next run resumes from the saved cursor.
 
 ### Features
 
@@ -38,35 +72,43 @@ Additionally, each document has system fields:
 | Incremental - Dedupe Sync     | Yes        |
 | Replicate Incremental Deletes | Yes        |
 | Change Data Capture           | Yes        |
+| Component tables              | Yes        |
 | Namespaces                    | No         |
 
 ### Performance considerations
 
-The Convex connector syncs all documents from the historical log.
-If you see performance issues due to syncing unnecessary old versions of documents,
-please reach out to [Convex support](mailto:support@convex.dev).
+The initial sync walks every selected table once, then streams changes. Pages are small, so a large
+deployment takes many requests; the connector checkpoints state every 25 pages by default.
 
 ## Getting started
 
 ### Requirements
 
-- Convex Account
-- Convex Project
-- Deploy key
+- Convex account and project on a Pro plan (streaming export requires Pro)
+- A deploy key with the `deployment:data:view` permission
 
 ### Setup guide
 
-Airbyte integration is available to Convex teams on Professional [plans](https://www.convex.dev/plans).
-
 On the [Convex dashboard](https://dashboard.convex.dev/), navigate to the project that you want to sync.
-Note only "Production" deployments should be synced.
-
-In the Data tab, you should see the tables and a sample of the data that will be synced.
+Only "Production" deployments should be synced.
 
 1. Navigate to the Settings tab.
 2. Copy the "Deployment URL" from the settings page to the `deployment_url` field in Airbyte.
-3. Click "Generate a deploy key".
+3. Click "Generate a deploy key" and grant it `deployment:data:view`.
 4. Copy the generated deploy key into the `access_key` field in Airbyte.
+5. Choose a schema source. Pick "Inline JSON" if you want tables from components.
+
+### Upgrading from 0.x
+
+Version 1.0.0 is a breaking change:
+
+- The connector reads from the Deployment API instead of the legacy `list_snapshot` and
+  `document_deltas` endpoints, so it needs a Pro plan and a deploy key with `deployment:data:view`.
+- State is a single Convex cursor stored per stream. Old 0.x state is ignored and the first sync starts from scratch.
+- Component tables get their own streams named `<component>__<table>`.
+- Records gain `_component` and `_table` fields.
+
+Refresh the source schema and reset affected connections after upgrading.
 
 ## Changelog
 
@@ -75,6 +117,7 @@ In the Data tab, you should see the tables and a sample of the data that will be
 
 | Version | Date       | Pull Request                                             | Subject                                                          |
 | :------ | :--------- | :------------------------------------------------------- | :--------------------------------------------------------------- |
+| 1.0.0 | 2026-09-03 | [PR_NUMBER](https://github.com/paralov/airbyte/pull/PR_NUMBER) | Rewrite on the Convex Deployment API data sync endpoint: one resumable cursor, component tables as streams, inline schema option |
 | 0.4.51 | 2025-10-07 | [65777](https://github.com/airbytehq/airbyte/pull/65777) | Update dependencies |
 | 0.4.50 | 2025-08-23 | [65287](https://github.com/airbytehq/airbyte/pull/65287) | Update dependencies |
 | 0.4.49 | 2025-08-16 | [65003](https://github.com/airbytehq/airbyte/pull/65003) | Update dependencies |
