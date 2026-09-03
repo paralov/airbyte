@@ -117,7 +117,7 @@ Refresh the source schema and reset affected connections after upgrading.
 
 | Version | Date       | Pull Request                                             | Subject                                                          |
 | :------ | :--------- | :------------------------------------------------------- | :--------------------------------------------------------------- |
-| 1.0.0 | 2026-09-03 | [PR_NUMBER](https://github.com/paralov/airbyte/pull/PR_NUMBER) | Rewrite on the Convex Deployment API data sync endpoint: one resumable cursor, component tables as streams, inline schema option |
+| 1.0.0 | 2026-09-03 | [1](https://github.com/paralov/airbyte/pull/1) | Rewrite on the Convex Deployment API data sync endpoint: one resumable cursor, component tables as streams, inline schema option |
 | 0.4.51 | 2025-10-07 | [65777](https://github.com/airbytehq/airbyte/pull/65777) | Update dependencies |
 | 0.4.50 | 2025-08-23 | [65287](https://github.com/airbytehq/airbyte/pull/65287) | Update dependencies |
 | 0.4.49 | 2025-08-16 | [65003](https://github.com/airbytehq/airbyte/pull/65003) | Update dependencies |
