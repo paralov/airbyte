@@ -1,11 +1,11 @@
 # See [Connector Acceptance Tests](https://docs.airbyte.io/connector-development/testing-connectors/connector-acceptance-tests-reference)
 # for more information about how to configure these tests
-connector_image: airbyte/source-convex:dev
+connector_image: airbyte/source-convex-data-sync:dev
 test_strictness_level: low
 acceptance_tests:
   spec:
     tests:
-      - spec_path: "source_convex/spec.yaml"
+      - spec_path: "source_convex_data_sync/spec.yaml"
   connection:
     tests:
       - config_path: "secrets/config.json"
@@ -15,8 +15,6 @@ acceptance_tests:
   discovery:
     tests:
       - config_path: "secrets/config.json"
-        backward_compatibility_tests_config:
-          disable_for_version: "0.1.1"
   # TODO: Need creds to run integration tests https://github.com/airbytehq/airbyte/issues/25571
   # basic_read:
   #   tests:

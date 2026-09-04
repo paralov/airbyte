@@ -1,16 +1,12 @@
-[
-  {
-    "type": "STREAM",
-    "stream": {
-      "stream_descriptor": { "name": "posts" },
-      "stream_state": { "cursor": "01b471f9dcd203c6", "sync_id": "50406f13-7ae9-4b15-a82b-ed974f006d8e", "selection_hash": "0123456789abcdef", "checkpointed_at": 1788466011116, "snapshot_complete": true }
-    }
+{
+  "posts": {
+    "snapshot_cursor": "hi",
+    "snapshot_has_more": false,
+    "delta_cursor": 1
   },
-  {
-    "type": "STREAM",
-    "stream": {
-      "stream_descriptor": { "name": "betterAuth__user" },
-      "stream_state": { "cursor": "01b471f9dcd203c6", "sync_id": "50406f13-7ae9-4b15-a82b-ed974f006d8e", "selection_hash": "0123456789abcdef", "checkpointed_at": 1788466011116, "snapshot_complete": true }
-    }
+  "users": {
+    "snapshot_cursor": null,
+    "snapshot_has_more": true,
+    "delta_cursor": null
   }
-]
+}

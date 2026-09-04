@@ -2,29 +2,24 @@
   "streams": [
     {
       "sync_mode": "incremental",
-      "destination_sync_mode": "append_dedup",
-      "primary_key": [["_id"]],
-      "cursor_field": ["_ts"],
+      "destination_sync_mode": "append",
       "stream": {
         "name": "posts",
         "json_schema": {
-          "$schema": "http://json-schema.org/draft-07/schema#",
           "type": "object",
-          "additionalProperties": true,
-          "x-convex-component": "",
-          "x-convex-table": "posts",
           "properties": {
-            "_id": { "type": "string" },
             "_creationTime": { "type": "number" },
-            "author": { "type": "string", "$description": "Id(users)" },
+            "_id": {
+              "type": "object",
+              "properties": { "$id": { "type": "string" } }
+            },
+            "author": {
+              "type": "object",
+              "properties": { "$id": { "type": "string" } }
+            },
             "body": { "type": "string" },
-            "_ts": { "type": "integer" },
-            "_deleted": { "type": "boolean" },
-            "_component": { "type": "string" },
-            "_table": { "type": "string" },
-            "_ab_cdc_lsn": { "type": "number" },
-            "_ab_cdc_updated_at": { "type": "string" },
-            "_ab_cdc_deleted_at": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+            "time": { "type": "number" },
+            "_ts": { "type": "number" }
           }
         },
         "supported_sync_modes": ["full_refresh", "incremental"],
@@ -35,29 +30,20 @@
     },
     {
       "sync_mode": "incremental",
-      "destination_sync_mode": "append_dedup",
-      "primary_key": [["_id"]],
-      "cursor_field": ["_ts"],
+      "destination_sync_mode": "append",
       "stream": {
-        "name": "betterAuth__user",
+        "name": "users",
         "json_schema": {
-          "$schema": "http://json-schema.org/draft-07/schema#",
           "type": "object",
-          "additionalProperties": true,
-          "x-convex-component": "betterAuth",
-          "x-convex-table": "user",
           "properties": {
-            "_id": { "type": "string" },
             "_creationTime": { "type": "number" },
-            "email": { "type": "string" },
+            "_id": {
+              "type": "object",
+              "properties": { "$id": { "type": "string" } }
+            },
             "name": { "type": "string" },
-            "_ts": { "type": "integer" },
-            "_deleted": { "type": "boolean" },
-            "_component": { "type": "string" },
-            "_table": { "type": "string" },
-            "_ab_cdc_lsn": { "type": "number" },
-            "_ab_cdc_updated_at": { "type": "string" },
-            "_ab_cdc_deleted_at": { "anyOf": [{ "type": "string" }, { "type": "null" }] }
+            "tokenIdentifier": { "type": "string" },
+            "_ts": { "type": "number" }
           }
         },
         "supported_sync_modes": ["full_refresh", "incremental"],

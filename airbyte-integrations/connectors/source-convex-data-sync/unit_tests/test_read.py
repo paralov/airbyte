@@ -5,7 +5,7 @@
 import logging
 
 import pytest
-from source_convex.source import SourceConvex
+from source_convex_data_sync.source import SourceConvexDataSync
 
 from airbyte_cdk.models import (
     AirbyteStateBlob,
@@ -25,7 +25,7 @@ logger = logging.getLogger("airbyte")
 
 
 def run(config, catalog, state=None):
-    messages = list(SourceConvex().read(logger, config, catalog, state))
+    messages = list(SourceConvexDataSync().read(logger, config, catalog, state))
     records = [m.record for m in messages if m.type == Type.RECORD]
     states = [m.state for m in messages if m.type == Type.STATE]
     statuses = [m.trace.stream_status.status for m in messages if m.type == Type.TRACE and m.trace.stream_status is not None]
@@ -289,7 +289,7 @@ def test_read_surfaces_other_errors_with_state(requests_mock, inline_config, cat
     )
     emitted = []
     with pytest.raises(AirbyteTracedException) as err:
-        for message in SourceConvex().read(logger, inline_config, catalog, None):
+        for message in SourceConvexDataSync().read(logger, inline_config, catalog, None):
             emitted.append(message)
     assert "deployment:data:view" in str(err.value.message)
     assert err.value.failure_type == FailureType.config_error
@@ -321,7 +321,7 @@ def test_read_checkpoints_every_n_pages(requests_mock, inline_config, catalog):
 
 
 def test_read_retries_on_server_errors(requests_mock, inline_config, catalog, monkeypatch):
-    monkeypatch.setattr("source_convex.source.time.sleep", lambda _: None)
+    monkeypatch.setattr("source_convex_data_sync.source.time.sleep", lambda _: None)
     requests_mock.post(
         SYNC_URL,
         [
@@ -344,21 +344,6 @@ def test_read_resumes_from_most_recent_checkpoint(requests_mock, inline_config, 
     ]
     run(inline_config, catalog, state)
     assert requests_mock.request_history[0].json()["cursor"] == "newer"
-
-
-def test_read_ignores_legacy_per_stream_state(requests_mock, inline_config, catalog):
-    legacy = [
-        AirbyteStateMessage(
-            type=AirbyteStateType.STREAM,
-            stream=AirbyteStreamState(
-                stream_descriptor=StreamDescriptor(name="posts"),
-                stream_state=AirbyteStateBlob(snapshot_cursor="x", snapshot_has_more=False, delta_cursor=1),
-            ),
-        )
-    ]
-    requests_mock.post(SYNC_URL, [{"json": page(cursor="c1", status={"type": "upToDate", "snapshotTs": 1})}])
-    run(inline_config, catalog, legacy)
-    assert "cursor" not in requests_mock.request_history[0].json()
 
 
 def test_read_with_empty_catalog_makes_no_requests(requests_mock, inline_config, catalog):

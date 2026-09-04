@@ -1,0 +1,5 @@
+{
+  "deployment_url": "https://murky-swan-635.convex.cloud",
+  "access_key": "prod:murky-swan-635|deploy-key",
+  "schema_source": { "type": "api" }
+}

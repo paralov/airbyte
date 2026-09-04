@@ -2,142 +2,114 @@
 # Copyright (c) 2023 Airbyte, Inc., all rights reserved.
 #
 
-import json
-import logging
+from unittest.mock import MagicMock
 
-import pytest
-from source_convex.source import SourceConvex, build_selection, parse_inline_schema, stream_name_for
-
-from airbyte_cdk.models import SyncMode
-from airbyte_cdk.utils.traced_exception import AirbyteTracedException
-from unit_tests.helpers import ACTIVE_SYNCS_URL, INLINE_SCHEMA, JSON_SCHEMAS_URL, POSTS_SCHEMA, USER_SCHEMA
+import responses
+from source_convex.source import SourceConvex
 
 
-logger = logging.getLogger("airbyte")
-
-
-def test_stream_names():
-    assert stream_name_for("", "posts") == "posts"
-    assert stream_name_for("betterAuth", "user") == "betterAuth__user"
-    assert stream_name_for("resend/emailWorkpool", "payload") == "resend__emailWorkpool__payload"
-
-
-def test_build_selection_includes_only_requested_tables():
-    selection = build_selection([("", "posts"), ("betterAuth", "user"), ("betterAuth", "session")])
-    assert selection == {
-        "_other": "excluded",
-        "": {"_other": "excluded", "posts": {"_other": "included"}},
-        "betterAuth": {"_other": "excluded", "user": {"_other": "included"}, "session": {"_other": "included"}},
+def setup_responses():
+    sample_shapes_resp = {
+        "posts": {
+            "type": "object",
+            "properties": {
+                "_creationTime": {"type": "number"},
+                "_id": {"$description": "Id(posts)", "type": "object", "properties": {"$id": {"type": "string"}}},
+                "author": {"$description": "Id(users)", "type": "object", "properties": {"$id": {"type": "string"}}},
+                "body": {"type": "string"},
+                "_ts": {"type": "integer"},
+                "_deleted": {"type": "boolean"},
+            },
+            "$schema": "http://json-schema.org/draft-07/schema#",
+        },
+        "users": {
+            "type": "object",
+            "properties": {
+                "_creationTime": {"type": "number"},
+                "_id": {"$description": "Id(users)", "type": "object", "properties": {"$id": {"type": "string"}}},
+                "name": {"type": "string"},
+                "tokenIdentifier": {"type": "string"},
+                "_ts": {"type": "integer"},
+                "_deleted": {"type": "boolean"},
+            },
+            "$schema": "http://json-schema.org/draft-07/schema#",
+        },
     }
+    responses.add(
+        responses.GET,
+        "https://murky-swan-635.convex.cloud/api/json_schemas?deltaSchema=true&format=json",
+        json=sample_shapes_resp,
+    )
+    responses.add(
+        responses.GET,
+        "https://curious-giraffe-964.convex.cloud/api/json_schemas?deltaSchema=true&format=json",
+        json={"code": "Error code", "message": "Error message"},
+        status=400,
+    )
 
 
-def test_parse_inline_schema_nested():
-    nested = parse_inline_schema(json.dumps(INLINE_SCHEMA))
-    assert set(nested) == {("", "posts"), ("betterAuth", "user"), ("resend/rateLimiter", "rateLimits")}
+@responses.activate
+def test_check_connection(mocker):
+    setup_responses()
+    source = SourceConvex()
+    logger_mock = MagicMock()
+    assert source.check_connection(
+        logger_mock,
+        {
+            "deployment_url": "https://murky-swan-635.convex.cloud",
+            "access_key": "test_api_key",
+        },
+    ) == (True, None)
 
 
-def test_parse_inline_schema_component_with_table_named_type():
-    # A table literally called "type" must not make the component map look like a bare JSON Schema.
-    parsed = parse_inline_schema(json.dumps({"betterAuth": {"type": USER_SCHEMA, "user": USER_SCHEMA}}))
-    assert set(parsed) == {("betterAuth", "type"), ("betterAuth", "user")}
+@responses.activate
+def test_check_bad_connection(mocker):
+    setup_responses()
+    source = SourceConvex()
+    logger_mock = MagicMock()
+    assert source.check_connection(
+        logger_mock,
+        {
+            "deployment_url": "https://curious-giraffe-964.convex.cloud",
+            "access_key": "test_api_key",
+        },
+    ) == (False, "Connection to Convex via json_schemas endpoint failed: 400: Error code: Error message")
 
 
-def test_parse_inline_schema_rejects_flat_form_with_hint():
-    with pytest.raises(AirbyteTracedException) as err:
-        parse_inline_schema(json.dumps({"posts": POSTS_SCHEMA}))
-    assert '{"": {"posts": <JSON Schema>}}' in err.value.message
-
-
-@pytest.mark.parametrize("bad", ["not json", "[]", json.dumps({"x": 1}), json.dumps({"": {"posts": "nope"}})])
-def test_parse_inline_schema_rejects_bad_input(bad):
-    with pytest.raises(AirbyteTracedException):
-        parse_inline_schema(bad)
-
-
-def test_check_connection_ok(requests_mock, inline_config):
-    requests_mock.get(ACTIVE_SYNCS_URL, json={"syncs": [], "pagination": {"hasMore": False}})
-    ok, error = SourceConvex().check_connection(logger, inline_config)
-    assert ok and error is None
-    assert requests_mock.last_request.headers["Authorization"] == "Convex test_api_key"
-    assert requests_mock.last_request.headers["Convex-Client"].startswith("airbyte-export-")
-
-
-def test_check_connection_bad_key(requests_mock, inline_config):
-    requests_mock.get(ACTIVE_SYNCS_URL, status_code=401, json={"code": "Unauthenticated", "message": "bad key"})
-    ok, error = SourceConvex().check_connection(logger, inline_config)
-    assert not ok
-    assert "Unauthenticated" in error and "bad key" in error
-
-
-def test_check_connection_api_schema_failure(requests_mock, api_config):
-    requests_mock.get(ACTIVE_SYNCS_URL, json={"syncs": [], "pagination": {"hasMore": False}})
-    requests_mock.get(JSON_SCHEMAS_URL, status_code=400, json={"code": "Error code", "message": "Error message"})
-    ok, error = SourceConvex().check_connection(logger, api_config)
-    assert not ok
-    assert "Error code" in error
-
-
-@pytest.mark.parametrize("response", [{"json": "Unauthorized"}, {"json": ["nope"]}, {"text": "<html>gateway</html>"}])
-def test_check_connection_reports_non_object_error_bodies(requests_mock, inline_config, response):
-    requests_mock.get(ACTIVE_SYNCS_URL, status_code=401, **response)
-    ok, error = SourceConvex().check_connection(logger, inline_config)
-    assert not ok
-    assert "401" in error
-
-
-def test_check_connection_reports_non_json_success_body(requests_mock, inline_config):
-    requests_mock.get(ACTIVE_SYNCS_URL, text="<html>login</html>")
-    ok, error = SourceConvex().check_connection(logger, inline_config)
-    assert not ok
-    assert "InvalidJSON" in error
-
-
-def test_streams_from_inline_schema(inline_config):
-    streams = SourceConvex().streams(inline_config)
-    by_name = {s.name: s for s in streams}
-    assert set(by_name) == {"posts", "betterAuth__user", "resend__rateLimiter__rateLimits"}
-    user = by_name["betterAuth__user"]
-    assert user.primary_key == "_id"
-    assert user.cursor_field == "_ts"
-    assert user.supports_incremental and user.source_defined_cursor
-    schema = user.get_json_schema()
-    assert schema["x-convex-component"] == "betterAuth"
-    assert schema["x-convex-table"] == "user"
-    assert schema["additionalProperties"] is True
-    for field in ("_ts", "_deleted", "_component", "_table", "_ab_cdc_lsn", "_ab_cdc_updated_at", "_ab_cdc_deleted_at"):
-        assert field in schema["properties"]
-    assert schema["properties"]["email"] == {"type": "string"}
-
-
-def test_streams_from_api(requests_mock, api_config):
-    requests_mock.get(JSON_SCHEMAS_URL, json={"": {"posts": POSTS_SCHEMA}, "betterAuth": {"user": USER_SCHEMA}})
-    streams = SourceConvex().streams(api_config)
-    assert [s.name for s in streams] == ["posts", "betterAuth__user"]
-    assert [(s.component, s.table) for s in streams] == [("", "posts"), ("betterAuth", "user")]
-    # Schemas are grouped by component and describe the export encoding the data sync endpoint uses.
-    assert requests_mock.last_request.qs == {"deltaschema": ["true"], "format": ["export_json"], "bycomponent": ["true"]}
-
-
-def test_streams_rejects_colliding_stream_names():
-    config = {
-        "deployment_url": "https://murky-swan-635.convex.cloud",
-        "access_key": "k",
-        "schema_source": {"type": "inline", "schema_json": json.dumps({"": {"audit__log": POSTS_SCHEMA}, "audit": {"log": USER_SCHEMA}})},
-    }
-    with pytest.raises(AirbyteTracedException) as err:
-        SourceConvex().streams(config)
-    assert "audit__log" in err.value.message
-
-
-def test_read_state_ignores_legacy_state_object(tmp_path):
-    path = tmp_path / "state.json"
-    path.write_text(json.dumps({"posts": {"snapshot_cursor": "hi", "snapshot_has_more": False, "delta_cursor": 1}}))
-    assert SourceConvex.read_state(str(path)) == []
-
-
-def test_discover_catalog(inline_config):
-    catalog = SourceConvex().discover(logger, inline_config)
-    stream = next(s for s in catalog.streams if s.name == "posts")
-    assert stream.supported_sync_modes == [SyncMode.full_refresh, SyncMode.incremental]
-    assert stream.default_cursor_field == ["_ts"]
-    assert stream.source_defined_primary_key == [["_id"]]
+@responses.activate
+def test_streams(mocker):
+    setup_responses()
+    source = SourceConvex()
+    streams = source.streams(
+        {
+            "deployment_url": "https://murky-swan-635.convex.cloud",
+            "access_key": "test_api_key",
+        }
+    )
+    assert len(streams) == 2
+    streams.sort(key=lambda stream: stream.table_name)
+    assert streams[0].table_name == "posts"
+    assert streams[1].table_name == "users"
+    assert all(stream.deployment_url == "https://murky-swan-635.convex.cloud" for stream in streams)
+    assert all(stream._session.auth.get_auth_header() == {"Authorization": "Convex test_api_key"} for stream in streams)
+    shapes = [stream.get_json_schema() for stream in streams]
+    assert all(shape["type"] == "object" for shape in shapes)
+    properties = [shape["properties"] for shape in shapes]
+    assert [
+        props["_id"]
+        == {
+            "type": "object",
+            "properties": {
+                "$id": {"type": "string"},
+            },
+        }
+        for props in properties
+    ]
+    assert [props["_ts"] == {"type": "number"} for props in properties]
+    assert [props["_creationTime"] == {"type": "number"} for props in properties]
+    assert set(properties[0].keys()) == set(
+        ["_id", "_ts", "_deleted", "_creationTime", "author", "body", "_ab_cdc_lsn", "_ab_cdc_updated_at", "_ab_cdc_deleted_at"]
+    )
+    assert set(properties[1].keys()) == set(
+        ["_id", "_ts", "_deleted", "_creationTime", "name", "tokenIdentifier", "_ab_cdc_lsn", "_ab_cdc_updated_at", "_ab_cdc_deleted_at"]
+    )

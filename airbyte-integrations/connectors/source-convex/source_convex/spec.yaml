@@ -10,71 +10,12 @@ connectionSpecification:
   properties:
     deployment_url:
       type: string
-      title: Deployment URL
-      description: The deployment's URL, from the Settings tab of the Convex dashboard.
-      order: 0
+      title: Deployment Url
       examples:
         - https://murky-swan-635.convex.cloud
         - https://cluttered-owl-337.convex.cloud
     access_key:
       type: string
-      title: Deploy Key
-      description: A deploy key with the deployment:data:view permission. Streaming export requires a Convex Pro plan.
+      title: Access Key
+      description: API access key used to retrieve data from Convex.
       airbyte_secret: true
-      order: 1
-    schema_source:
-      type: object
-      title: Table Schemas
-      description: >-
-        Where to get JSON Schemas for the tables. "Fetch from deployment" asks the deployment for the schema of
-        every table, including tables inside installed components. Use an inline schema to pin schemas or to sync
-        only some tables. The inline format is {"<component path>": {"<table>": <JSON Schema>}}, with "" for the
-        root component.
-      order: 2
-      oneOf:
-        - title: Fetch from deployment
-          required:
-            - type
-          properties:
-            type:
-              type: string
-              const: api
-              order: 0
-        - title: Inline JSON
-          required:
-            - type
-            - schema_json
-          properties:
-            type:
-              type: string
-              const: inline
-              order: 0
-            schema_json:
-              type: string
-              title: Schema JSON
-              description: JSON object mapping component paths to tables to JSON Schemas.
-              multiline: true
-              order: 1
-    max_pages_per_sync:
-      type: integer
-      title: Max Pages Per Sync
-      description: >-
-        Stop after this many data sync pages and checkpoint; the next sync resumes from the saved cursor.
-        0 means run until the sync is up to date.
-      default: 0
-      minimum: 0
-      order: 3
-    state_checkpoint_pages:
-      type: integer
-      title: State Checkpoint Interval (pages)
-      description: Emit a state message after this many pages.
-      default: 25
-      minimum: 1
-      order: 4
-    request_timeout_seconds:
-      type: integer
-      title: Request Timeout (seconds)
-      description: How long to wait for one deployment API request before retrying it.
-      default: 120
-      minimum: 5
-      order: 5
