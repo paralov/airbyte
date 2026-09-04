@@ -12,7 +12,8 @@ returns a single opaque cursor per page. That maps onto Airbyte as:
   root component and ``<component path>__<table>`` (``/`` becomes ``__``) for
   component tables;
 * per-stream Airbyte state that each carry the same Convex cursor (the CDK
-  requires per-stream state), plus a little per-stream bookkeeping;
+  entrypoint's record counting requires per-stream state), plus a little
+  per-stream bookkeeping;
 * the configured catalog driving the Convex ``selection`` so the deployment only
   ships tables Airbyte asked for.
 
@@ -26,13 +27,13 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Set, Tuple
 
 import requests
 
+from airbyte_cdk.connector import BaseConnector
 from airbyte_cdk.models import (
     AirbyteMessage,
-    AirbyteRecordMessage,
     AirbyteStateBlob,
     AirbyteStateMessage,
     AirbyteStateType,
@@ -46,9 +47,12 @@ from airbyte_cdk.models import (
 )
 from airbyte_cdk.sources import AbstractSource
 from airbyte_cdk.sources.streams import Stream
+from airbyte_cdk.sources.utils.record_helper import stream_data_to_airbyte_message
 from airbyte_cdk.utils.stream_status_utils import as_airbyte_message as stream_status_message
 from airbyte_cdk.utils.traced_exception import AirbyteTracedException, FailureType
 
+
+LOGGER = logging.getLogger("airbyte")
 
 CONVEX_CLIENT_VERSION = "1.0.0"
 CONVEX_CLIENT_HEADER = f"airbyte-export-{CONVEX_CLIENT_VERSION}"
@@ -56,16 +60,20 @@ CONVEX_CLIENT_HEADER = f"airbyte-export-{CONVEX_CLIENT_VERSION}"
 ROOT_COMPONENT = ""
 COMPONENT_SEPARATOR = "__"
 
-# Status values observed from the endpoint. The published OpenAPI types say
-# ``inProgress`` / ``synced``; the live API says ``snapshotting`` / ``stale`` /
-# ``upToDate``. Treat both vocabularies as equivalent.
-UP_TO_DATE_STATUSES = {"upToDate", "synced"}
+# The documented ``status.type`` values are ``snapshotting``, ``stale`` and ``upToDate``.
+# ``pagination.hasMore`` is documented as always true, so ``upToDate`` is the only completion signal.
+UP_TO_DATE_STATUS = "upToDate"
 
 # Error codes that mean the cursor is unusable and the sync must restart.
 RESTART_ERROR_CODES = {"DataSyncCursorExpired", "InvalidDataSyncCursor"}
 
+# Responses that mean the request itself is wrong (bad URL, key, plan or selection) rather than transient.
+CONFIG_ERROR_STATUS_CODES = {400, 401, 403, 404}
+
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 120
-MAX_RETRIES = 5
+MAX_ATTEMPTS = 5
+MAX_BACKOFF_SECONDS = 30
+MAX_RETRY_AFTER_SECONDS = 60
 STATE_CHECKPOINT_PAGES = 25
 
 SYSTEM_FIELD_SCHEMAS: Dict[str, Dict[str, Any]] = {
@@ -87,7 +95,11 @@ SYSTEM_FIELD_SCHEMAS: Dict[str, Dict[str, Any]] = {
 
 
 def stream_name_for(component: str, table: str) -> str:
-    """``users`` for root tables, ``betterAuth__user`` / ``resend__emailWorkpool__payload`` for component tables."""
+    """``users`` for root tables, ``betterAuth__user`` / ``resend__emailWorkpool__payload`` for component tables.
+
+    Convex identifiers may themselves contain ``__``, so this mapping is not injective; ``SourceConvex.streams``
+    rejects deployments where two tables collide, and ``read`` never parses names back.
+    """
     if component == ROOT_COMPONENT:
         return table
     return f"{component.replace('/', COMPONENT_SEPARATOR)}{COMPONENT_SEPARATOR}{table}"
@@ -105,13 +117,29 @@ class ConvexApiError(Exception):
         self.code = code
         self.message = message
 
+    @property
+    def failure_type(self) -> FailureType:
+        return FailureType.config_error if self.status_code in CONFIG_ERROR_STATUS_CODES else FailureType.system_error
+
+    def as_traced(self) -> AirbyteTracedException:
+        return AirbyteTracedException(message=str(self), failure_type=self.failure_type)
+
 
 def _parse_error(resp: requests.Response) -> Tuple[Optional[str], str]:
     try:
         err = resp.json()
-        return err.get("code"), err.get("message", resp.text)
     except ValueError:
         return None, resp.text
+    if isinstance(err, dict):
+        return err.get("code"), str(err.get("message", resp.text))
+    return None, resp.text
+
+
+def _retry_delay(resp: requests.Response, attempt: int) -> float:
+    retry_after = resp.headers.get("Retry-After")
+    if retry_after and retry_after.isdigit():
+        return min(float(retry_after), MAX_RETRY_AFTER_SECONDS)
+    return min(2**attempt, MAX_BACKOFF_SECONDS)
 
 
 class ConvexClient:
@@ -149,15 +177,20 @@ class ConvexClient:
             try:
                 resp = self.session.request(method, url, json=json_body, params=params, timeout=self.timeout)
             except requests.RequestException as e:
-                if attempt >= MAX_RETRIES:
+                if attempt >= MAX_ATTEMPTS:
                     raise ConvexApiError(context, 0, "RequestException", str(e)) from e
-                time.sleep(min(2**attempt, 30))
+                delay = min(2**attempt, MAX_BACKOFF_SECONDS)
+                LOGGER.info("%s: %s; retrying in %.0fs (attempt %d/%d)", context, e, delay, attempt, MAX_ATTEMPTS)
+                time.sleep(delay)
                 continue
             if resp.status_code == 200:
-                return resp.json()
-            if resp.status_code in (429, 500, 502, 503, 504) and attempt < MAX_RETRIES:
-                retry_after = resp.headers.get("Retry-After")
-                delay = float(retry_after) if retry_after and retry_after.isdigit() else min(2**attempt, 30)
+                try:
+                    return resp.json()
+                except ValueError as e:
+                    raise ConvexApiError(context, 200, "InvalidJSON", resp.text[:200]) from e
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt < MAX_ATTEMPTS:
+                delay = _retry_delay(resp, attempt)
+                LOGGER.info("%s: HTTP %d; retrying in %.0fs (attempt %d/%d)", context, resp.status_code, delay, attempt, MAX_ATTEMPTS)
                 time.sleep(delay)
                 continue
             code, message = _parse_error(resp)
@@ -175,11 +208,14 @@ class ConvexClient:
         return self._request("POST", "/api/v1/data/sync", "Data sync page", json_body=body)
 
     def json_schemas(self) -> Mapping[str, Any]:
+        """``{component path: {table: schema}}`` describing values the way ``/api/v1/data/sync`` encodes them."""
         return self._request(
             "GET",
             "/api/json_schemas",
             "Fetching table schemas",
-            params={"deltaSchema": "true", "format": "json"},
+            # byComponent groups tables under their component path ("" for the root); export_json matches the
+            # lossless encoding the data sync endpoint always uses (int64 as {"$integer": ...} and so on).
+            params={"deltaSchema": "true", "format": "export_json", "byComponent": "true"},
         )
 
 
@@ -191,12 +227,13 @@ class ConvexClient:
 TableSchemas = Dict[Tuple[str, str], Dict[str, Any]]  # (component, table) -> JSON schema
 
 
-def _looks_like_json_schema(value: Any) -> bool:
-    return isinstance(value, dict) and ("properties" in value or "type" in value or "anyOf" in value or "$schema" in value)
+def _looks_like_bare_schema(value: Mapping[str, Any]) -> bool:
+    """A JSON Schema has string-valued ``type``/``$schema`` keywords; a ``{table: schema}`` map only has dict values."""
+    return isinstance(value.get("type"), (str, list)) or isinstance(value.get("$schema"), str)
 
 
 def parse_inline_schema(schema_json: str) -> TableSchemas:
-    """Accepts ``{component: {table: schema}}`` or the flat ``{table: schema}`` form (root only)."""
+    """Parses the ``{"<component path>": {"<table>": <JSON Schema>}}`` form, with ``""`` for the root component."""
     try:
         parsed = json.loads(schema_json)
     except ValueError as e:
@@ -208,38 +245,44 @@ def parse_inline_schema(schema_json: str) -> TableSchemas:
     if not isinstance(parsed, dict):
         raise AirbyteTracedException(message="The inline schema must be a JSON object.", failure_type=FailureType.config_error)
     out: TableSchemas = {}
-    for key, value in parsed.items():
-        if _looks_like_json_schema(value):
-            out[(ROOT_COMPONENT, key)] = value
-        elif isinstance(value, dict):
-            for table, schema in value.items():
-                if not isinstance(schema, dict):
-                    raise AirbyteTracedException(
-                        message=f"Schema for table {key!r}/{table!r} must be a JSON Schema object.",
-                        failure_type=FailureType.config_error,
-                    )
-                out[(key, table)] = schema
-        else:
+    for component, tables in parsed.items():
+        if not isinstance(tables, dict):
             raise AirbyteTracedException(
-                message=f"Unexpected value for key {key!r} in inline schema.",
+                message=f"Inline schema entry {component!r} must map table names to JSON Schemas.",
                 failure_type=FailureType.config_error,
             )
+        if _looks_like_bare_schema(tables):
+            raise AirbyteTracedException(
+                message=(
+                    f"Inline schema entry {component!r} looks like a table schema. Wrap root tables under the empty "
+                    f'component path: {{"": {{"{component}": <JSON Schema>}}}}.'
+                ),
+                failure_type=FailureType.config_error,
+            )
+        for table, schema in tables.items():
+            if not isinstance(schema, dict):
+                raise AirbyteTracedException(
+                    message=f"Schema for table {component!r}/{table!r} must be a JSON Schema object.",
+                    failure_type=FailureType.config_error,
+                )
+            out[(component, table)] = schema
     return out
 
 
 def schemas_from_api(client: ConvexClient) -> TableSchemas:
-    """``/api/json_schemas`` is keyed by bare table name and cannot distinguish components; treat everything as root."""
-    return {(ROOT_COMPONENT, table): schema for table, schema in client.json_schemas().items()}
+    return {(component, table): schema for component, tables in client.json_schemas().items() for table, schema in tables.items()}
 
 
 def airbyte_schema_for(table_schema: Mapping[str, Any]) -> Dict[str, Any]:
     """Copy the table schema, add system + CDC fields, and relax ``additionalProperties``."""
     schema: Dict[str, Any] = {"$schema": "http://json-schema.org/draft-07/schema#", "type": "object"}
-    if "anyOf" in table_schema:
+    branches = table_schema.get("anyOf")
+    if isinstance(branches, list):
         # Union document types: merge every branch's properties into one permissive schema.
         properties: Dict[str, Any] = {}
-        for branch in table_schema["anyOf"]:
-            properties.update(branch.get("properties", {}))
+        for branch in branches:
+            if isinstance(branch, dict):
+                properties.update(branch.get("properties", {}))
     else:
         properties = dict(table_schema.get("properties", {}))
     properties.update(SYSTEM_FIELD_SCHEMAS)
@@ -273,14 +316,6 @@ class ConvexTableStream(Stream):
     def name(self) -> str:
         return stream_name_for(self.component, self.table)
 
-    @property
-    def supports_incremental(self) -> bool:
-        return True
-
-    @property
-    def source_defined_cursor(self) -> bool:
-        return True
-
     def get_json_schema(self) -> Mapping[str, Any]:
         return self._json_schema
 
@@ -294,27 +329,18 @@ class ConvexTableStream(Stream):
 
 
 def _blob_to_dict(blob: Any) -> Dict[str, Any]:
-    if blob is None:
-        return {}
-    if isinstance(blob, dict):
-        return dict(blob)
-    for attr in ("model_dump", "dict"):
-        fn = getattr(blob, attr, None)
-        if callable(fn):
-            try:
-                return dict(fn())
-            except TypeError:
-                pass
-    return {k: v for k, v in vars(blob).items() if not k.startswith("_")}
+    # AirbyteStateBlob is a plain attribute bag; the entrypoint always hands us that type (or None).
+    return {} if blob is None else dict(vars(blob))
 
 
 class SyncState:
     """Convex sync state.
 
     The Convex cursor covers every table, but the Airbyte CDK entrypoint requires
-    per-stream state messages, so the same cursor is written into every stream's
-    state at each checkpoint along with a ``checkpointed_at`` stamp. On resume the
-    most recently checkpointed cursor wins.
+    per-stream state messages (``message_utils.get_stream_descriptor`` rejects
+    GLOBAL state), so the same cursor is written into every stream's state at each
+    checkpoint along with a ``checkpointed_at`` stamp. On resume the most recently
+    checkpointed cursor wins.
     """
 
     SHARED_KEYS = ("cursor", "sync_id", "selection_hash", "checkpointed_at")
@@ -324,6 +350,10 @@ class SyncState:
         self.sync_id: Optional[str] = None
         self.selection_hash: Optional[str] = None
         self.streams: Dict[str, Dict[str, Any]] = {}
+
+    @classmethod
+    def _stream_keys(cls, blob: Mapping[str, Any]) -> Dict[str, Any]:
+        return {k: v for k, v in blob.items() if k not in cls.SHARED_KEYS}
 
     @classmethod
     def from_messages(cls, logger: logging.Logger, state: Optional[List[AirbyteStateMessage]]) -> "SyncState":
@@ -337,16 +367,18 @@ class SyncState:
                 blob = _blob_to_dict(message.stream.stream_state)
                 if "cursor" in blob:
                     candidates.append(blob)
-                    out.streams[name] = {k: v for k, v in blob.items() if k not in cls.SHARED_KEYS}
+                    out.streams[name] = cls._stream_keys(blob)
             elif message.type == AirbyteStateType.GLOBAL and message.global_ is not None:
                 shared = _blob_to_dict(message.global_.shared_state)
                 if "cursor" in shared:
                     candidates.append(shared)
                 for stream_state in message.global_.stream_states or []:
-                    out.streams[stream_state.stream_descriptor.name] = _blob_to_dict(stream_state.stream_state)
+                    name = stream_state.stream_descriptor.name
+                    out.streams[name] = cls._stream_keys(_blob_to_dict(stream_state.stream_state))
         if not candidates:
             logger.warning(
-                "No resumable Convex cursor in the incoming state (state from source-convex < 1.0.0 is not resumable); starting a fresh data sync."
+                "No resumable Convex cursor in the incoming state (state from source-convex < 1.0.0 is not resumable); "
+                "starting a fresh data sync."
             )
             return out
         latest = max(candidates, key=lambda c: c.get("checkpointed_at") or 0)
@@ -354,6 +386,15 @@ class SyncState:
         out.sync_id = latest.get("sync_id")
         out.selection_hash = latest.get("selection_hash")
         return out
+
+    def restart(self) -> None:
+        """Forget the cursor and every per-stream flag: the next page starts a brand new data sync."""
+        self.cursor = None
+        self.sync_id = None
+        self.streams = {}
+
+    def stream(self, name: str) -> Dict[str, Any]:
+        return self.streams.setdefault(name, {})
 
     def to_messages(self, stream_names: Iterable[str]) -> Iterator[AirbyteMessage]:
         checkpointed_at = int(time.time() * 1000)
@@ -381,10 +422,10 @@ class SyncState:
 
 def build_selection(pairs: Iterable[Tuple[str, str]]) -> Dict[str, Any]:
     """Convex ``selection`` body that includes exactly the given ``(component, table)`` pairs."""
-    selection: Dict[str, Any] = {"_other": "excl"}
+    selection: Dict[str, Any] = {"_other": "excluded"}
     for component, table in pairs:
-        component_selection = selection.setdefault(component, {"_other": "excl"})
-        component_selection[table] = {"_other": "incl"}
+        component_selection = selection.setdefault(component, {"_other": "excluded"})
+        component_selection[table] = {"_other": "included"}
     return selection
 
 
@@ -396,6 +437,7 @@ def _record_from_value(value: Mapping[str, Any]) -> Dict[str, Any]:
     record = dict(value["value"])
     ts_ns = int(value["ts"])
     deleted = bool(value.get("deleted", False))
+    # Naive UTC ISO string, matching what source-convex < 1.0.0 emitted.
     ts_iso = datetime.fromtimestamp(ts_ns / 1e9, tz=timezone.utc).replace(tzinfo=None).isoformat()
     record["_ts"] = ts_ns
     record["_deleted"] = deleted
@@ -433,13 +475,20 @@ class SourceConvex(AbstractSource):
 
     # -- check / discover -------------------------------------------------
 
+    @classmethod
+    def read_state(cls, state_path: str) -> List[AirbyteStateMessage]:
+        # source-convex < 1.0.0 wrote a legacy ``{stream: state}`` object; the CDK only parses the list form.
+        if state_path:
+            state_obj = BaseConnector._read_json_file(state_path)
+            if isinstance(state_obj, dict):
+                LOGGER.warning("Ignoring legacy (pre-1.0.0) state object; the sync will start from scratch.")
+                return []
+        return super().read_state(state_path)
+
     def check_connection(self, logger: logging.Logger, config: Mapping[str, Any]) -> Tuple[bool, Any]:
         client = self._client(config)
         try:
             client.list_active_syncs()
-        except ConvexApiError as e:
-            return False, str(e)
-        try:
             schemas = self._table_schemas(config, client)
         except AirbyteTracedException as e:
             return False, e.message
@@ -454,8 +503,20 @@ class SourceConvex(AbstractSource):
         try:
             schemas = self._table_schemas(config, client)
         except ConvexApiError as e:
-            raise AirbyteTracedException(message=str(e), failure_type=FailureType.config_error) from e
-        return [ConvexTableStream(component, table, schema) for (component, table), schema in sorted(schemas.items())]
+            raise e.as_traced() from e
+        streams = [ConvexTableStream(component, table, schema) for (component, table), schema in sorted(schemas.items())]
+        seen: Dict[str, ConvexTableStream] = {}
+        for stream in streams:
+            other = seen.setdefault(stream.name, stream)
+            if other is not stream:
+                raise AirbyteTracedException(
+                    message=(
+                        f"Tables {other.component or '<root>'}/{other.table} and {stream.component or '<root>'}/{stream.table} "
+                        f"both map to the Airbyte stream name {stream.name!r}. Rename one of them or exclude it with an inline schema."
+                    ),
+                    failure_type=FailureType.config_error,
+                )
+        return streams
 
     # -- read -------------------------------------------------------------
 
@@ -467,7 +528,7 @@ class SourceConvex(AbstractSource):
         state: Optional[List[AirbyteStateMessage]] = None,
     ) -> Iterator[AirbyteMessage]:
         client = self._client(config)
-        configured = self._configured_streams(catalog)
+        configured = {cs.stream.name: cs for cs in catalog.streams}
         if not configured:
             logger.info("No streams selected; nothing to sync.")
             return
@@ -475,47 +536,74 @@ class SourceConvex(AbstractSource):
         max_pages = int(config.get("max_pages_per_sync") or 0)
         checkpoint_pages = int(config.get("state_checkpoint_pages") or STATE_CHECKPOINT_PAGES)
 
-        by_name = configured
-        pair_to_name = {self._pair_for(cs): name for name, cs in configured.items()}
+        # Resolve every configured stream to its (component, table) against what the deployment exposes now.
+        known = {stream.name: (stream.component, stream.table) for stream in self.streams(config)}
+        pair_to_name: Dict[Tuple[str, str], str] = {}
+        for name, cs in configured.items():
+            pair = self._pair_for(cs, known)
+            if pair is None or pair not in known.values():
+                logger.warning(
+                    "The stream %r in your connection configuration was not found in the source. Refresh the schema in your "
+                    "connection or inline schema to remove it.",
+                    name,
+                )
+                yield stream_status_message(cs.stream, AirbyteStreamStatus.INCOMPLETE)
+                continue
+            pair_to_name[pair] = name
+        selected = {name: configured[name] for name in pair_to_name.values()}
+        if not selected:
+            return
+
         full_selection = build_selection(pair_to_name.keys())
         full_hash = _selection_hash(full_selection)
 
-        full_refresh_names = {name for name, cs in configured.items() if cs.sync_mode == SyncMode.full_refresh}
         resuming = sync_state.cursor is not None
         if resuming and sync_state.selection_hash and sync_state.selection_hash != full_hash:
             logger.info("Stream selection changed since the last sync; Convex will sync newly selected tables from scratch.")
 
-        for name in configured:
-            yield stream_status_message(configured[name].stream, AirbyteStreamStatus.STARTED)
+        for cs in selected.values():
+            yield stream_status_message(cs.stream, AirbyteStreamStatus.STARTED)
 
-        # Full refresh streams on a resumed sync: deselect them for one page so Convex
-        # re-syncs them from scratch when they are selected again.
+        # Streams that must be re-sent from scratch on a resumed sync: full refresh streams, and streams whose
+        # own state was cleared (the platform's per-stream reset) or that were never synced before. Deselecting
+        # them for one page and reselecting them makes Convex re-sync them from scratch with a leading truncate
+        # (documented ``selection`` semantics).
         priming_selection: Optional[Dict[str, Any]] = None
-        if resuming and full_refresh_names:
-            keep = [pair for pair, name in pair_to_name.items() if name not in full_refresh_names]
-            priming_selection = build_selection(keep)
-            logger.info("Full refresh requested for %s; asking Convex to re-sync them from scratch.", sorted(full_refresh_names))
+        if resuming:
+            resnapshot = {name for name, cs in selected.items() if cs.sync_mode == SyncMode.full_refresh or name not in sync_state.streams}
+            if resnapshot:
+                keep = [pair for pair, name in pair_to_name.items() if name not in resnapshot]
+                priming_selection = build_selection(keep)
+                for name in resnapshot:
+                    sync_state.stream(name)["snapshot_complete"] = False
+                logger.info("Asking Convex to re-sync %s from scratch.", sorted(resnapshot))
 
-        running_emitted: set = set()
+        def finish(status: AirbyteStreamStatus) -> Iterator[AirbyteMessage]:
+            yield from sync_state.to_messages(selected.keys())
+            for cs in selected.values():
+                yield stream_status_message(cs.stream, status)
+
+        running_emitted: Set[str] = set()
         dropped: Dict[Tuple[str, str], int] = {}
         pages = 0
         records = 0
         restarted = False
+        status_type: Optional[str] = None
 
         try:
             while True:
-                selection = priming_selection if priming_selection is not None else full_selection
+                priming = priming_selection is not None
+                selection = priming_selection if priming else full_selection
                 try:
                     page = client.data_sync(sync_state.cursor, selection)
                 except ConvexApiError as e:
                     if e.code in RESTART_ERROR_CODES and sync_state.cursor is not None and not restarted:
                         logger.warning("Convex rejected the saved cursor (%s); restarting the data sync from scratch.", e.code)
-                        sync_state.cursor = None
-                        sync_state.sync_id = None
+                        sync_state.restart()
                         priming_selection = None
                         restarted = True
                         continue
-                    raise AirbyteTracedException(message=str(e), failure_type=FailureType.system_error) from e
+                    raise e.as_traced() from e
                 priming_selection = None
                 pages += 1
 
@@ -527,7 +615,7 @@ class SourceConvex(AbstractSource):
                     name = pair_to_name.get(pair)
                     if name is None:
                         continue
-                    stream_state = sync_state.streams.setdefault(name, {})
+                    stream_state = sync_state.stream(name)
                     if stream_state.get("snapshot_complete"):
                         # Truncates during the initial snapshot are normal; after it they mean the table was replaced.
                         logger.warning(
@@ -536,7 +624,6 @@ class SourceConvex(AbstractSource):
                             truncate["table"],
                             pair[0],
                         )
-                        stream_state["truncated_at"] = int(time.time() * 1000)
                     stream_state["snapshot_complete"] = False
 
                 for value in page.get("values", []):
@@ -547,32 +634,27 @@ class SourceConvex(AbstractSource):
                         continue
                     if name not in running_emitted:
                         running_emitted.add(name)
-                        yield stream_status_message(by_name[name].stream, AirbyteStreamStatus.RUNNING)
-                    record = _record_from_value(value)
+                        yield stream_status_message(selected[name].stream, AirbyteStreamStatus.RUNNING)
                     records += 1
-                    stream_state = sync_state.streams.setdefault(name, {})
-                    stream_state["last_ts"] = max(int(stream_state.get("last_ts") or 0), record["_ts"])
-                    yield AirbyteMessage(
-                        type=Type.RECORD,
-                        record=AirbyteRecordMessage(stream=name, data=record, emitted_at=int(time.time() * 1000)),
-                    )
+                    yield stream_data_to_airbyte_message(name, _record_from_value(value))
 
                 sync_state.cursor = page["pagination"]["nextCursor"]
-                status = page.get("status", {})
-                status_type = status.get("type")
-                up_to_date = status_type in UP_TO_DATE_STATUSES
-                if up_to_date:
-                    for name in configured:
-                        sync_state.streams.setdefault(name, {})["snapshot_complete"] = True
-                        if "snapshotTs" in status:
-                            sync_state.streams[name]["snapshot_ts"] = status["snapshotTs"]
+                status_type = page.get("status", {}).get("type")
+                up_to_date = status_type == UP_TO_DATE_STATUS
+                # The priming page describes a sync that still excludes the re-snapshot streams, so it never
+                # counts as complete for them.
+                if up_to_date and not priming:
+                    for name in selected:
+                        sync_state.stream(name)["snapshot_complete"] = True
 
                 if pages % checkpoint_pages == 0:
-                    yield from sync_state.to_messages(configured.keys())
+                    yield from sync_state.to_messages(selected.keys())
 
-                empty_page = not page.get("values") and not page.get("truncates")
-                # `hasMore` stays true on an up to date sync, so completion is "up to date and nothing new on this page".
-                if (up_to_date and empty_page) or not page["pagination"].get("hasMore", True):
+                if priming:
+                    continue  # Always fetch at least one page with the full selection so the deselected tables come back.
+                # An upToDate page is a consistent snapshot through its snapshotTs. `hasMore` is always true on a
+                # live sync and a busy deployment can keep upToDate pages non-empty forever, so stop here.
+                if up_to_date:
                     break
                 if max_pages and pages >= max_pages:
                     logger.info(
@@ -580,36 +662,22 @@ class SourceConvex(AbstractSource):
                     )
                     break
         except Exception:
-            yield from sync_state.to_messages(configured.keys())
-            for name in configured:
-                yield stream_status_message(configured[name].stream, AirbyteStreamStatus.INCOMPLETE)
+            yield from finish(AirbyteStreamStatus.INCOMPLETE)
             raise
 
-        yield from sync_state.to_messages(configured.keys())
-        for name in configured:
-            yield stream_status_message(configured[name].stream, AirbyteStreamStatus.COMPLETE)
+        yield from finish(AirbyteStreamStatus.COMPLETE)
         if dropped:
             logger.warning(
                 "Dropped %d documents from tables not in the configured catalog: %s",
                 sum(dropped.values()),
                 ", ".join(f"{c or '<root>'}/{t}={n}" for (c, t), n in sorted(dropped.items())),
             )
-        logger.info(
-            "Convex data sync %s: %d pages, %d records, status=%s", sync_state.sync_id, pages, records, status_type if pages else "none"
-        )
+        logger.info("Convex data sync %s: %d pages, %d records, status=%s", sync_state.sync_id, pages, records, status_type or "none")
 
     @staticmethod
-    def _configured_streams(catalog: ConfiguredAirbyteCatalog) -> Dict[str, ConfiguredAirbyteStream]:
-        return {cs.stream.name: cs for cs in catalog.streams}
-
-    @staticmethod
-    def _pair_for(configured_stream: ConfiguredAirbyteStream) -> Tuple[str, str]:
-        """Recover ``(component, table)`` from a stream. Prefers the schema's origin hint, else parses the name."""
+    def _pair_for(configured_stream: ConfiguredAirbyteStream, known: Mapping[str, Tuple[str, str]]) -> Optional[Tuple[str, str]]:
+        """Recover ``(component, table)`` from a stream: the schema's origin hint, else the discovered stream of that name."""
         schema = configured_stream.stream.json_schema or {}
         if "x-convex-table" in schema:
             return schema.get("x-convex-component", ROOT_COMPONENT), schema["x-convex-table"]
-        name = configured_stream.stream.name
-        if COMPONENT_SEPARATOR not in name:
-            return ROOT_COMPONENT, name
-        *component_parts, table = name.split(COMPONENT_SEPARATOR)
-        return "/".join(component_parts), table
+        return known.get(configured_stream.stream.name)

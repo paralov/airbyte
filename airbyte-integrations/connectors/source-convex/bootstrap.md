@@ -14,7 +14,7 @@ The connector uses the [Convex Deployment API](https://docs.convex.dev/deploymen
    `truncates` (tables to drop), `values` (document upserts and tombstones, each tagged with its
    component path and table), a `status`, and an opaque `nextCursor`. One cursor covers all tables.
 2. `GET /api/v1/data/list_active_syncs` is used as the connection check.
-3. `GET /api/json_schemas` supplies table schemas when no inline schema is configured. It only knows
-   about root tables, so component tables need the inline schema option.
+3. `GET /api/json_schemas?byComponent=true&format=export_json` supplies a schema for every table,
+   grouped by component path, when no inline schema is configured.
 
 See [https://docs.convex.dev/deployment-api/data-sync](https://docs.convex.dev/deployment-api/data-sync).

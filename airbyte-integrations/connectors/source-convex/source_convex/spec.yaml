@@ -26,10 +26,10 @@ connectionSpecification:
       type: object
       title: Table Schemas
       description: >-
-        Where to get JSON Schemas for the tables. The deployment API only describes tables in the root component,
-        so use an inline schema to sync tables that live inside installed components (for example betterAuth or
-        rateLimiter). The inline format is {"<component path>": {"<table>": <JSON Schema>}}, with "" for the root
-        component.
+        Where to get JSON Schemas for the tables. "Fetch from deployment" asks the deployment for the schema of
+        every table, including tables inside installed components. Use an inline schema to pin schemas or to sync
+        only some tables. The inline format is {"<component path>": {"<table>": <JSON Schema>}}, with "" for the
+        root component.
       order: 2
       oneOf:
         - title: Fetch from deployment
@@ -74,6 +74,7 @@ connectionSpecification:
     request_timeout_seconds:
       type: integer
       title: Request Timeout (seconds)
+      description: How long to wait for one deployment API request before retrying it.
       default: 120
       minimum: 5
       order: 5

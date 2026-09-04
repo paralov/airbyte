@@ -17,7 +17,7 @@ from airbyte_cdk.models import (
     SyncMode,
     Type,
 )
-from airbyte_cdk.utils.traced_exception import AirbyteTracedException
+from airbyte_cdk.utils.traced_exception import AirbyteTracedException, FailureType
 from unit_tests.helpers import SYNC_URL, page, value
 
 
@@ -116,23 +116,22 @@ def test_read_routes_records_by_component(requests_mock, inline_config, catalog)
     first = requests_mock.request_history[0].json()
     assert "cursor" not in first
     assert first["selection"] == {
-        "_other": "excl",
-        "": {"_other": "excl", "posts": {"_other": "incl"}},
-        "betterAuth": {"_other": "excl", "user": {"_other": "incl"}},
-        "resend/rateLimiter": {"_other": "excl", "rateLimits": {"_other": "incl"}},
+        "_other": "excluded",
+        "": {"_other": "excluded", "posts": {"_other": "included"}},
+        "betterAuth": {"_other": "excluded", "user": {"_other": "included"}},
+        "resend/rateLimiter": {"_other": "excluded", "rateLimits": {"_other": "included"}},
     }
-    assert [r.json().get("cursor") for r in requests_mock.request_history] == [None, "c1", "c2", "c3"]
+    assert [r.json().get("cursor") for r in requests_mock.request_history] == [None, "c1", "c2"]
 
-    # Stopped on the first empty upToDate page even though hasMore stayed true.
-    assert len(requests_mock.request_history) == 4
+    # Stopped on the first upToDate page even though it carried values and hasMore stayed true.
+    assert len(requests_mock.request_history) == 3
 
     # Final checkpoint: every stream carries the same last cursor.
     assert all(s.type == AirbyteStateType.STREAM for s in states)
     stream_states = last_states(states)
     assert set(stream_states) == {"posts", "betterAuth__user", "resend__rateLimiter__rateLimits"}
-    assert {s["cursor"] for s in stream_states.values()} == {"c4"}
+    assert {s["cursor"] for s in stream_states.values()} == {"c3"}
     assert {s["sync_id"] for s in stream_states.values()} == {"sync-1"}
-    assert stream_states["betterAuth__user"]["last_ts"] == 50_000_000_000
     assert stream_states["betterAuth__user"]["snapshot_complete"] is True
 
     # Stream status lifecycle.
@@ -162,7 +161,99 @@ def test_read_full_refresh_stream_is_reselected(requests_mock, inline_config, ca
     run(inline_config, catalog, global_state("c1"))
     first, second = requests_mock.request_history[0].json(), requests_mock.request_history[1].json()
     assert "betterAuth" not in first["selection"]
-    assert second["selection"]["betterAuth"] == {"_other": "excl", "user": {"_other": "incl"}}
+    assert second["selection"]["betterAuth"] == {"_other": "excluded", "user": {"_other": "included"}}
+
+
+def test_read_full_refresh_is_reselected_even_when_priming_page_is_up_to_date(requests_mock, inline_config, catalog, caplog):
+    catalog.streams[1].sync_mode = SyncMode.full_refresh  # betterAuth__user
+    requests_mock.post(
+        SYNC_URL,
+        [
+            {"json": page(cursor="c2", status={"type": "upToDate", "snapshotTs": 1})},
+            {
+                "json": page(
+                    truncates=[{"component": "betterAuth", "table": "user"}],
+                    values=[value("betterAuth", "user", {"_id": "u1", "_creationTime": 1.0, "email": "a@b.c"})],
+                    cursor="c3",
+                    status={"type": "upToDate", "snapshotTs": 2},
+                )
+            },
+        ],
+    )
+    with caplog.at_level(logging.WARNING):
+        _, records, states, _ = run(inline_config, catalog, global_state("c1"))
+    assert len(requests_mock.request_history) == 2
+    assert "betterAuth" not in requests_mock.request_history[0].json()["selection"]
+    assert "betterAuth" in requests_mock.request_history[1].json()["selection"]
+    assert [r.stream for r in records] == ["betterAuth__user"]
+    assert last_states(states)["betterAuth__user"]["snapshot_complete"] is True
+    # The truncate that starts the re-sync is expected, not a post-snapshot table replacement.
+    assert "truncated table" not in caplog.text
+
+
+def test_read_all_full_refresh_still_fetches_full_selection(requests_mock, inline_config, catalog):
+    for cs in catalog.streams:
+        cs.sync_mode = SyncMode.full_refresh
+    requests_mock.post(SYNC_URL, [{"json": page(cursor="c2", status={"type": "upToDate", "snapshotTs": 1})}])
+    run(inline_config, catalog, global_state("c1"))
+    assert requests_mock.request_history[0].json()["selection"] == {"_other": "excluded"}
+    assert "posts" in requests_mock.request_history[1].json()["selection"][""]
+
+
+def test_read_max_pages_does_not_stop_on_priming_page(requests_mock, inline_config, catalog):
+    inline_config["max_pages_per_sync"] = 1
+    catalog.streams[0].sync_mode = SyncMode.full_refresh  # posts
+    requests_mock.post(SYNC_URL, [{"json": page(cursor="c2")}, {"json": page(cursor="c3")}])
+    run(inline_config, catalog, global_state("c1"))
+    assert len(requests_mock.request_history) == 2
+
+
+def test_read_resnapshots_streams_whose_state_was_cleared(requests_mock, inline_config, catalog):
+    # The platform's per-stream "Clear data" passes state for the other streams only.
+    requests_mock.post(SYNC_URL, [{"json": page(cursor="c9", status={"type": "upToDate", "snapshotTs": 1})}])
+    run(inline_config, catalog, [stream_state("posts", "c8"), stream_state("betterAuth__user", "c8")])
+    first, second = requests_mock.request_history[0].json(), requests_mock.request_history[1].json()
+    assert first["cursor"] == "c8"
+    assert "resend/rateLimiter" not in first["selection"]
+    assert "resend/rateLimiter" in second["selection"]
+
+
+def test_read_accepts_global_state_with_shared_keys_in_stream_states(requests_mock, inline_config, catalog):
+    from airbyte_cdk.models import AirbyteGlobalState
+
+    state = [
+        AirbyteStateMessage(
+            type=AirbyteStateType.GLOBAL,
+            global_=AirbyteGlobalState(
+                shared_state=AirbyteStateBlob(cursor="g1", sync_id="sync-1", checkpointed_at=5),
+                stream_states=[
+                    AirbyteStreamState(
+                        stream_descriptor=StreamDescriptor(name=name),
+                        stream_state=AirbyteStateBlob(cursor="g1", checkpointed_at=5, snapshot_complete=True),
+                    )
+                    for name in ("posts", "betterAuth__user", "resend__rateLimiter__rateLimits")
+                ],
+            ),
+        )
+    ]
+    requests_mock.post(SYNC_URL, [{"json": page(cursor="g2", status={"type": "upToDate", "snapshotTs": 1})}])
+    _, _, states, _ = run(inline_config, catalog, state)
+    assert requests_mock.request_history[0].json()["cursor"] == "g1"
+    assert shared(states[-1])["cursor"] == "g2"
+
+
+def test_read_skips_streams_missing_from_the_source(requests_mock, inline_config, catalog):
+    from unit_tests.helpers import POSTS_SCHEMA, configured_stream
+
+    catalog.streams.append(configured_stream("comments", "", "comments", POSTS_SCHEMA))
+    requests_mock.post(SYNC_URL, [{"json": page(cursor="c1", status={"type": "upToDate", "snapshotTs": 1})}])
+    messages, _, states, _ = run(inline_config, catalog)
+    assert "comments" not in requests_mock.request_history[0].json()["selection"][""]
+    incomplete = [m.trace.stream_status for m in messages if m.type == Type.TRACE and m.trace.stream_status]
+    assert [(s.stream_descriptor.name, s.status) for s in incomplete if s.status == AirbyteStreamStatus.INCOMPLETE] == [
+        ("comments", AirbyteStreamStatus.INCOMPLETE)
+    ]
+    assert "comments" not in last_states(states)
 
 
 def test_read_restarts_on_expired_cursor(requests_mock, inline_config, catalog):
@@ -201,6 +292,7 @@ def test_read_surfaces_other_errors_with_state(requests_mock, inline_config, cat
         for message in SourceConvex().read(logger, inline_config, catalog, None):
             emitted.append(message)
     assert "deployment:data:view" in str(err.value.message)
+    assert err.value.failure_type == FailureType.config_error
     states = [m.state for m in emitted if m.type == Type.STATE]
     assert shared(states[-1])["cursor"] == "c1"
     statuses = [m.trace.stream_status.status for m in emitted if m.type == Type.TRACE and m.trace.stream_status]
@@ -245,7 +337,11 @@ def test_read_retries_on_server_errors(requests_mock, inline_config, catalog, mo
 
 def test_read_resumes_from_most_recent_checkpoint(requests_mock, inline_config, catalog):
     requests_mock.post(SYNC_URL, [{"json": page(cursor="c9", status={"type": "upToDate", "snapshotTs": 1})}])
-    state = [stream_state("posts", "old", checkpointed_at=1), stream_state("betterAuth__user", "newer", checkpointed_at=2)]
+    state = [
+        stream_state("posts", "old", checkpointed_at=1),
+        stream_state("betterAuth__user", "newer", checkpointed_at=2),
+        stream_state("resend__rateLimiter__rateLimits", "old", checkpointed_at=1),
+    ]
     run(inline_config, catalog, state)
     assert requests_mock.request_history[0].json()["cursor"] == "newer"
 

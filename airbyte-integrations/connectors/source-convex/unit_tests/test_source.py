@@ -25,20 +25,30 @@ def test_stream_names():
 def test_build_selection_includes_only_requested_tables():
     selection = build_selection([("", "posts"), ("betterAuth", "user"), ("betterAuth", "session")])
     assert selection == {
-        "_other": "excl",
-        "": {"_other": "excl", "posts": {"_other": "incl"}},
-        "betterAuth": {"_other": "excl", "user": {"_other": "incl"}, "session": {"_other": "incl"}},
+        "_other": "excluded",
+        "": {"_other": "excluded", "posts": {"_other": "included"}},
+        "betterAuth": {"_other": "excluded", "user": {"_other": "included"}, "session": {"_other": "included"}},
     }
 
 
-def test_parse_inline_schema_nested_and_flat():
+def test_parse_inline_schema_nested():
     nested = parse_inline_schema(json.dumps(INLINE_SCHEMA))
     assert set(nested) == {("", "posts"), ("betterAuth", "user"), ("resend/rateLimiter", "rateLimits")}
-    flat = parse_inline_schema(json.dumps({"posts": POSTS_SCHEMA, "users": USER_SCHEMA}))
-    assert set(flat) == {("", "posts"), ("", "users")}
 
 
-@pytest.mark.parametrize("bad", ["not json", "[]", json.dumps({"x": 1})])
+def test_parse_inline_schema_component_with_table_named_type():
+    # A table literally called "type" must not make the component map look like a bare JSON Schema.
+    parsed = parse_inline_schema(json.dumps({"betterAuth": {"type": USER_SCHEMA, "user": USER_SCHEMA}}))
+    assert set(parsed) == {("betterAuth", "type"), ("betterAuth", "user")}
+
+
+def test_parse_inline_schema_rejects_flat_form_with_hint():
+    with pytest.raises(AirbyteTracedException) as err:
+        parse_inline_schema(json.dumps({"posts": POSTS_SCHEMA}))
+    assert '{"": {"posts": <JSON Schema>}}' in err.value.message
+
+
+@pytest.mark.parametrize("bad", ["not json", "[]", json.dumps({"x": 1}), json.dumps({"": {"posts": "nope"}})])
 def test_parse_inline_schema_rejects_bad_input(bad):
     with pytest.raises(AirbyteTracedException):
         parse_inline_schema(bad)
@@ -67,6 +77,21 @@ def test_check_connection_api_schema_failure(requests_mock, api_config):
     assert "Error code" in error
 
 
+@pytest.mark.parametrize("response", [{"json": "Unauthorized"}, {"json": ["nope"]}, {"text": "<html>gateway</html>"}])
+def test_check_connection_reports_non_object_error_bodies(requests_mock, inline_config, response):
+    requests_mock.get(ACTIVE_SYNCS_URL, status_code=401, **response)
+    ok, error = SourceConvex().check_connection(logger, inline_config)
+    assert not ok
+    assert "401" in error
+
+
+def test_check_connection_reports_non_json_success_body(requests_mock, inline_config):
+    requests_mock.get(ACTIVE_SYNCS_URL, text="<html>login</html>")
+    ok, error = SourceConvex().check_connection(logger, inline_config)
+    assert not ok
+    assert "InvalidJSON" in error
+
+
 def test_streams_from_inline_schema(inline_config):
     streams = SourceConvex().streams(inline_config)
     by_name = {s.name: s for s in streams}
@@ -85,10 +110,29 @@ def test_streams_from_inline_schema(inline_config):
 
 
 def test_streams_from_api(requests_mock, api_config):
-    requests_mock.get(JSON_SCHEMAS_URL, json={"posts": POSTS_SCHEMA, "users": USER_SCHEMA})
+    requests_mock.get(JSON_SCHEMAS_URL, json={"": {"posts": POSTS_SCHEMA}, "betterAuth": {"user": USER_SCHEMA}})
     streams = SourceConvex().streams(api_config)
-    assert [s.name for s in streams] == ["posts", "users"]
-    assert all(s.get_json_schema()["x-convex-component"] == "" for s in streams)
+    assert [s.name for s in streams] == ["posts", "betterAuth__user"]
+    assert [(s.component, s.table) for s in streams] == [("", "posts"), ("betterAuth", "user")]
+    # Schemas are grouped by component and describe the export encoding the data sync endpoint uses.
+    assert requests_mock.last_request.qs == {"deltaschema": ["true"], "format": ["export_json"], "bycomponent": ["true"]}
+
+
+def test_streams_rejects_colliding_stream_names():
+    config = {
+        "deployment_url": "https://murky-swan-635.convex.cloud",
+        "access_key": "k",
+        "schema_source": {"type": "inline", "schema_json": json.dumps({"": {"audit__log": POSTS_SCHEMA}, "audit": {"log": USER_SCHEMA}})},
+    }
+    with pytest.raises(AirbyteTracedException) as err:
+        SourceConvex().streams(config)
+    assert "audit__log" in err.value.message
+
+
+def test_read_state_ignores_legacy_state_object(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text(json.dumps({"posts": {"snapshot_cursor": "hi", "snapshot_has_more": False, "delta_cursor": 1}}))
+    assert SourceConvex.read_state(str(path)) == []
 
 
 def test_discover_catalog(inline_config):

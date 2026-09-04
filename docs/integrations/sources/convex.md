@@ -39,12 +39,15 @@ Values that JSON cannot represent are encoded as described in the
 Airbyte needs a JSON Schema for each stream. The connector can get it two ways, chosen with the
 "Table Schemas" option:
 
-- **Fetch from deployment** asks the deployment for its schemas. This only describes tables in the
-  root component; tables inside components are not discovered.
+- **Fetch from deployment** asks the deployment for the schema of every table, including tables
+  inside installed components. Tables without a schema get a permissive schema.
 - **Inline JSON** takes a JSON object of the form `{"<component path>": {"<table>": <JSON Schema>}}`,
-  with `""` as the root component path. Use this to sync component tables. You can generate the
-  object from your `convex.config.ts` and each component's `schema.ts` with a small script that reads
-  every table validator's `.json` representation and converts it to JSON Schema.
+  with `""` as the root component path. Use this to pin schemas or to expose only some tables. You
+  can generate the object from your `convex.config.ts` and each component's `schema.ts` with a small
+  script that reads every table validator's `.json` representation and converts it to JSON Schema.
+
+Two tables that map to the same stream name (for example a root table `audit__log` and a table `log`
+inside a component `audit`) are rejected; rename one of them or leave it out of an inline schema.
 
 ### State and sync behaviour
 
@@ -53,15 +56,18 @@ stores that same cursor in every stream's state at each checkpoint and resumes f
 one. Consequences:
 
 - Enabling a new stream makes Convex sync that table from scratch; nothing else is re-sent.
-- A Full Refresh stream is deselected for one page and reselected, which makes Convex re-send it
-  in full. Other streams keep streaming changes.
+- A Full Refresh stream, or a stream whose data you cleared in Airbyte, is deselected for one page
+  and reselected, which makes Convex re-send it in full. Other streams keep streaming changes.
 - The cursor expires after 3 days without a sync. The connector then restarts from scratch and
   re-sends everything; Incremental Dedupe destinations absorb this.
 - If Convex truncates a table (for example after `npx convex import --replace`), the connector logs
   a warning and the table is re-sent in full. Rows deleted by the truncate are not tombstoned, so
   reset that stream in the destination if you need an exact mirror.
-- A sync stops when Convex reports the export is up to date and a page carries no changes. Set
-  "Max Pages Per Sync" to bound very large initial syncs; the next run resumes from the saved cursor.
+- A sync stops at the first page on which Convex reports the export is up to date; that page is a
+  consistent snapshot of every selected table. Set "Max Pages Per Sync" to bound very large initial
+  syncs; the next run resumes from the saved cursor.
+- A stream that is still in the connection but no longer in the deployment (or the inline schema) is
+  skipped with a warning; refresh the source schema to remove it.
 
 ### Features
 
@@ -78,7 +84,9 @@ one. Consequences:
 ### Performance considerations
 
 The initial sync walks every selected table once, then streams changes. Pages are small, so a large
-deployment takes many requests; the connector checkpoints state every 25 pages by default.
+deployment takes many requests; the connector checkpoints state every 25 pages by default ("State
+Checkpoint Interval"). Each request waits up to "Request Timeout" seconds and is retried with backoff
+on transient errors.
 
 ## Getting started
 
@@ -96,7 +104,7 @@ Only "Production" deployments should be synced.
 2. Copy the "Deployment URL" from the settings page to the `deployment_url` field in Airbyte.
 3. Click "Generate a deploy key" and grant it `deployment:data:view`.
 4. Copy the generated deploy key into the `access_key` field in Airbyte.
-5. Choose a schema source. Pick "Inline JSON" if you want tables from components.
+5. Choose a schema source. "Fetch from deployment" covers root and component tables.
 
 ### Upgrading from 0.x
 
