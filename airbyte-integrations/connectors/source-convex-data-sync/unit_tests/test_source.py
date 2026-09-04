@@ -6,11 +6,17 @@ import json
 import logging
 
 import pytest
-from source_convex_data_sync.source import SourceConvexDataSync, build_selection, parse_inline_schema, stream_name_for
+from source_convex_data_sync.source import (
+    SourceConvexDataSync,
+    build_selection,
+    parse_schema_json,
+    stream_name_for,
+    validator_to_json_schema,
+)
 
 from airbyte_cdk.models import SyncMode
 from airbyte_cdk.utils.traced_exception import AirbyteTracedException
-from unit_tests.helpers import ACTIVE_SYNCS_URL, INLINE_SCHEMA, JSON_SCHEMAS_URL, POSTS_SCHEMA, USER_SCHEMA
+from unit_tests.helpers import ACTIVE_SYNCS_URL, POSTS_VALIDATOR, SCHEMA, USER_VALIDATOR, obj
 
 
 logger = logging.getLogger("airbyte")
@@ -31,27 +37,73 @@ def test_build_selection_includes_only_requested_tables():
     }
 
 
-def test_parse_inline_schema_nested():
-    nested = parse_inline_schema(json.dumps(INLINE_SCHEMA))
-    assert set(nested) == {("", "posts"), ("betterAuth", "user"), ("resend/rateLimiter", "rateLimits")}
+def test_parse_schema_json_nested():
+    parsed = parse_schema_json(json.dumps(SCHEMA))
+    assert set(parsed) == {("", "posts"), ("betterAuth", "user"), ("resend/rateLimiter", "rateLimits")}
 
 
-def test_parse_inline_schema_component_with_table_named_type():
-    # A table literally called "type" must not make the component map look like a bare JSON Schema.
-    parsed = parse_inline_schema(json.dumps({"betterAuth": {"type": USER_SCHEMA, "user": USER_SCHEMA}}))
+def test_parse_schema_json_component_with_table_named_type():
+    # A table literally called "type" must not make the component map look like a bare validator.
+    parsed = parse_schema_json(json.dumps({"betterAuth": {"type": USER_VALIDATOR, "user": USER_VALIDATOR}}))
     assert set(parsed) == {("betterAuth", "type"), ("betterAuth", "user")}
 
 
-def test_parse_inline_schema_rejects_flat_form_with_hint():
+def test_parse_schema_json_null_marks_schemaless_table():
+    parsed = parse_schema_json(json.dumps({"": {"scratch": None}}))
+    assert parsed == {("", "scratch"): None}
+
+
+def test_parse_schema_json_rejects_flat_form_with_hint():
     with pytest.raises(AirbyteTracedException) as err:
-        parse_inline_schema(json.dumps({"posts": POSTS_SCHEMA}))
-    assert '{"": {"posts": <JSON Schema>}}' in err.value.message
+        parse_schema_json(json.dumps({"posts": POSTS_VALIDATOR}))
+    assert '{"": {"posts": <validator>}}' in err.value.message
 
 
 @pytest.mark.parametrize("bad", ["not json", "[]", json.dumps({"x": 1}), json.dumps({"": {"posts": "nope"}})])
-def test_parse_inline_schema_rejects_bad_input(bad):
+def test_parse_schema_json_rejects_bad_input(bad):
     with pytest.raises(AirbyteTracedException):
-        parse_inline_schema(bad)
+        parse_schema_json(bad)
+
+
+def test_validator_to_json_schema_covers_every_validator_kind():
+    validator = obj(
+        {
+            "s": ({"type": "string"}, False),
+            "n": ({"type": "number"}, False),
+            "b": ({"type": "boolean"}, True),
+            "big": ({"type": "bigint"}, False),
+            "bytes": ({"type": "bytes"}, False),
+            "nil": ({"type": "null"}, False),
+            "anything": ({"type": "any"}, False),
+            "lit": ({"type": "literal", "value": "open"}, False),
+            "ref": ({"type": "id", "tableName": "users"}, False),
+            "list": ({"type": "array", "value": {"type": "string"}}, False),
+            "map": ({"type": "record", "keys": {"type": "string"}, "values": {"fieldType": {"type": "number"}, "optional": False}}, False),
+            "either": ({"type": "union", "value": [{"type": "string"}, {"type": "null"}]}, False),
+            "nested": (obj({"x": ({"type": "number"}, False)}), False),
+        }
+    )
+    schema = validator_to_json_schema(validator)
+    p = schema["properties"]
+    assert p["s"] == {"type": "string"}
+    assert p["n"]["anyOf"][0] == {"type": "number"}
+    assert p["b"] == {"type": "boolean"} and "b" not in schema["required"]
+    assert p["big"]["properties"] == {"$integer": {"type": "string"}}
+    assert p["bytes"]["properties"] == {"$bytes": {"type": "string"}}
+    assert p["nil"] == {"type": "null"}
+    assert p["anything"] == {}
+    assert p["lit"] == {"type": "string", "enum": ["open"]}
+    assert p["ref"] == {"type": "string", "$description": "Id(users)"}
+    assert p["list"] == {"type": "array", "items": {"type": "string"}}
+    assert p["map"]["additionalProperties"]["anyOf"][0] == {"type": "number"}
+    assert p["either"] == {"anyOf": [{"type": "string"}, {"type": "null"}]}
+    assert p["nested"]["properties"]["x"]["anyOf"][0] == {"type": "number"}
+    assert schema["additionalProperties"] is False
+
+
+def test_validator_to_json_schema_rejects_unknown_kind():
+    with pytest.raises(AirbyteTracedException):
+        validator_to_json_schema({"type": "tuple"})
 
 
 def test_check_connection_ok(requests_mock, inline_config):
@@ -67,14 +119,6 @@ def test_check_connection_bad_key(requests_mock, inline_config):
     ok, error = SourceConvexDataSync().check_connection(logger, inline_config)
     assert not ok
     assert "Unauthenticated" in error and "bad key" in error
-
-
-def test_check_connection_api_schema_failure(requests_mock, api_config):
-    requests_mock.get(ACTIVE_SYNCS_URL, json={"syncs": [], "pagination": {"hasMore": False}})
-    requests_mock.get(JSON_SCHEMAS_URL, status_code=400, json={"code": "Error code", "message": "Error message"})
-    ok, error = SourceConvexDataSync().check_connection(logger, api_config)
-    assert not ok
-    assert "Error code" in error
 
 
 @pytest.mark.parametrize("response", [{"json": "Unauthorized"}, {"json": ["nope"]}, {"text": "<html>gateway</html>"}])
@@ -107,21 +151,36 @@ def test_streams_from_inline_schema(inline_config):
     for field in ("_ts", "_deleted", "_component", "_table", "_ab_cdc_lsn", "_ab_cdc_updated_at", "_ab_cdc_deleted_at"):
         assert field in schema["properties"]
     assert schema["properties"]["email"] == {"type": "string"}
+    assert schema["properties"]["name"] == {"anyOf": [{"type": "null"}, {"type": "string"}]}
 
 
-def test_streams_from_api(requests_mock, api_config):
-    requests_mock.get(JSON_SCHEMAS_URL, json={"": {"posts": POSTS_SCHEMA}, "betterAuth": {"user": USER_SCHEMA}})
-    streams = SourceConvexDataSync().streams(api_config)
-    assert [s.name for s in streams] == ["posts", "betterAuth__user"]
-    assert [(s.component, s.table) for s in streams] == [("", "posts"), ("betterAuth", "user")]
-    # Schemas are grouped by component and describe the export encoding the data sync endpoint uses.
-    assert requests_mock.last_request.qs == {"deltaschema": ["true"], "format": ["export_json"], "bycomponent": ["true"]}
+def test_streams_schemaless_table_is_permissive():
+    config = {
+        "deployment_url": "https://murky-swan-635.convex.cloud",
+        "access_key": "k",
+        "schema_json": json.dumps({"": {"scratch": None}}),
+    }
+    (stream,) = SourceConvexDataSync().streams(config)
+    schema = stream.get_json_schema()
+    assert stream.name == "scratch"
+    assert schema["additionalProperties"] is True
+    assert set(schema["properties"]) == {
+        "_id",
+        "_creationTime",
+        "_ts",
+        "_deleted",
+        "_component",
+        "_table",
+        "_ab_cdc_lsn",
+        "_ab_cdc_updated_at",
+        "_ab_cdc_deleted_at",
+    }
 
 
 COLLIDING_CONFIG = {
     "deployment_url": "https://murky-swan-635.convex.cloud",
     "access_key": "k",
-    "schema_source": {"type": "inline", "schema_json": json.dumps({"": {"audit__log": POSTS_SCHEMA}, "audit": {"log": USER_SCHEMA}})},
+    "schema_json": json.dumps({"": {"audit__log": POSTS_VALIDATOR}, "audit": {"log": USER_VALIDATOR}}),
 }
 
 

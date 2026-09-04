@@ -1,5 +1,5 @@
 {
   "deployment_url": "https://murky-swan-635.convex.cloud",
   "access_key": "prod:murky-swan-635|deploy-key",
-  "schema_source": { "type": "api" }
+  "schema_json": "{\"\": {\"posts\": {\"type\": \"object\", \"value\": {\"author\": {\"fieldType\": {\"type\": \"id\", \"tableName\": \"users\"}, \"optional\": false}, \"body\": {\"fieldType\": {\"type\": \"string\"}, \"optional\": false}}}}, \"betterAuth\": {\"user\": {\"type\": \"object\", \"value\": {\"email\": {\"fieldType\": {\"type\": \"string\"}, \"optional\": false}, \"name\": {\"fieldType\": {\"type\": \"string\"}, \"optional\": true}}}}}"
 }

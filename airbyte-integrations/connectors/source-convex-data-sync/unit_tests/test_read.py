@@ -18,7 +18,7 @@ from airbyte_cdk.models import (
     Type,
 )
 from airbyte_cdk.utils.traced_exception import AirbyteTracedException, FailureType
-from unit_tests.helpers import JSON_SCHEMAS_URL, SYNC_URL, page, value
+from unit_tests.helpers import SYNC_URL, page, value
 
 
 logger = logging.getLogger("airbyte")
@@ -262,34 +262,6 @@ def test_read_invalid_cursor_is_a_config_error(requests_mock, inline_config, cat
     assert err.value.failure_type == FailureType.config_error
     assert "deployment URL" in err.value.message
     assert len(requests_mock.request_history) == 1
-
-
-def test_read_falls_back_to_schema_hints_when_schema_fetch_fails(requests_mock, api_config, catalog):
-    requests_mock.get(JSON_SCHEMAS_URL, status_code=400, json={"code": "NoSchemaForExport", "message": "table junk has no schema"})
-    requests_mock.post(
-        SYNC_URL,
-        [
-            {
-                "json": page(
-                    values=[value("betterAuth", "user", {"_id": "u1", "_creationTime": 1.0, "email": "a@b.c"})],
-                    cursor="c1",
-                    status={"type": "upToDate", "snapshotTs": 1},
-                )
-            },
-        ],
-    )
-    _, records, _, statuses = run(api_config, catalog)
-    assert [r.stream for r in records] == ["betterAuth__user"]
-    assert requests_mock.request_history[-1].json()["selection"]["betterAuth"] == {"_other": "excluded", "user": {"_other": "included"}}
-    assert statuses.count(AirbyteStreamStatus.COMPLETE) == 3
-
-
-def test_read_schema_fetch_failure_is_fatal_without_hints(requests_mock, api_config, catalog):
-    requests_mock.get(JSON_SCHEMAS_URL, status_code=400, json={"code": "NoSchemaForExport", "message": "table junk has no schema"})
-    del catalog.streams[0].stream.json_schema["x-convex-table"]
-    with pytest.raises(AirbyteTracedException):
-        list(SourceConvexDataSync().read(logger, api_config, catalog, None))
-    assert not any(r.url == SYNC_URL for r in requests_mock.request_history)
 
 
 def test_read_surfaces_other_errors_with_state(requests_mock, inline_config, catalog):

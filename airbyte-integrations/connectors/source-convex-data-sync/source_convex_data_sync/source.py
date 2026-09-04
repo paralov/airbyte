@@ -15,7 +15,9 @@ returns a single opaque cursor per page. That maps onto Airbyte as:
   entrypoint's record counting requires per-stream state), plus a little
   per-stream bookkeeping;
 * the configured catalog driving the Convex ``selection`` so the deployment only
-  ships tables Airbyte asked for.
+  ships tables Airbyte asked for;
+* table schemas supplied by the user as Convex validator JSON (schemas are
+  opt-in in Convex, so the connector never asks the deployment for one).
 
 See https://docs.convex.dev/deployment-api/data-sync.
 """
@@ -224,75 +226,110 @@ class ConvexClient:
             body["selection"] = selection
         return self._request("POST", "/api/v1/data/sync", "Data sync page", json_body=body)
 
-    def json_schemas(self) -> Mapping[str, Any]:
-        """``{component path: {table: schema}}`` describing values the way ``/api/v1/data/sync`` encodes them."""
-        return self._request(
-            "GET",
-            "/api/json_schemas",
-            "Fetching table schemas",
-            # byComponent groups tables under their component path ("" for the root); export_json matches the
-            # lossless encoding the data sync endpoint always uses (int64 as {"$integer": ...} and so on).
-            params={"deltaSchema": "true", "format": "export_json", "byComponent": "true"},
-        )
-
 
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
 
 
-TableSchemas = Dict[Tuple[str, str], Dict[str, Any]]  # (component, table) -> JSON schema
+TableSchemas = Dict[Tuple[str, str], Optional[Dict[str, Any]]]  # (component, table) -> Convex validator JSON, or None
+
+# Convex encodes values JSON cannot represent (see https://docs.convex.dev/database/types).
+INT64_SCHEMA: Dict[str, Any] = {"type": "object", "properties": {"$integer": {"type": "string"}}, "required": ["$integer"]}
+BYTES_SCHEMA: Dict[str, Any] = {"type": "object", "properties": {"$bytes": {"type": "string"}}, "required": ["$bytes"]}
+FLOAT_SCHEMA: Dict[str, Any] = {"anyOf": [{"type": "number"}, {"type": "object", "properties": {"$float": {"type": "string"}}}]}
 
 
-def _looks_like_bare_schema(value: Mapping[str, Any]) -> bool:
-    """A JSON Schema has string-valued ``type``/``$schema`` keywords; a ``{table: schema}`` map only has dict values."""
-    return isinstance(value.get("type"), (str, list)) or isinstance(value.get("$schema"), str)
+def validator_to_json_schema(validator: Mapping[str, Any]) -> Dict[str, Any]:
+    """Convert Convex validator JSON (the ``.json`` of ``v.object({...})`` etc.) to a draft-07 JSON Schema.
+
+    Convex schemas are opt-in and validators are the only schema primitive Convex has, so the connector takes
+    them verbatim rather than inventing its own format.
+    """
+    kind = validator.get("type")
+    if kind == "null":
+        return {"type": "null"}
+    if kind == "number":
+        return dict(FLOAT_SCHEMA)
+    if kind == "boolean":
+        return {"type": "boolean"}
+    if kind == "string":
+        return {"type": "string"}
+    if kind == "any":
+        return {}
+    if kind == "bigint":
+        return dict(INT64_SCHEMA)
+    if kind == "bytes":
+        return dict(BYTES_SCHEMA)
+    if kind == "literal":
+        value = validator.get("value")
+        json_type = {bool: "boolean", int: "number", float: "number", str: "string"}.get(type(value), "string")
+        return {"type": json_type, "enum": [value]}
+    if kind == "id":
+        return {"type": "string", "$description": f"Id({validator.get('tableName', '?')})"}
+    if kind == "array":
+        return {"type": "array", "items": validator_to_json_schema(validator.get("value") or {"type": "any"})}
+    if kind == "record":
+        values = (validator.get("values") or {}).get("fieldType") or {"type": "any"}
+        return {"type": "object", "additionalProperties": validator_to_json_schema(values)}
+    if kind == "object":
+        properties: Dict[str, Any] = {}
+        required: List[str] = []
+        for name, field in (validator.get("value") or {}).items():
+            field_type = field.get("fieldType") if isinstance(field, dict) and "fieldType" in field else field
+            properties[name] = validator_to_json_schema(field_type or {"type": "any"})
+            if not (isinstance(field, dict) and field.get("optional")):
+                required.append(name)
+        return {"type": "object", "properties": properties, "required": required, "additionalProperties": False}
+    if kind == "union":
+        return {"anyOf": [validator_to_json_schema(member) for member in validator.get("value") or []]}
+    raise AirbyteTracedException(message=f"Unknown Convex validator type {kind!r}.", failure_type=FailureType.config_error)
 
 
-def parse_inline_schema(schema_json: str) -> TableSchemas:
-    """Parses the ``{"<component path>": {"<table>": <JSON Schema>}}`` form, with ``""`` for the root component."""
+def parse_schema_json(schema_json: str) -> TableSchemas:
+    """Parses ``{"<component path>": {"<table>": <Convex validator JSON> | null}}``, with ``""`` for the root component.
+
+    ``null`` marks a table that exists but has no schema; it gets a permissive stream schema.
+    """
     try:
         parsed = json.loads(schema_json)
     except ValueError as e:
         raise AirbyteTracedException(
-            message="The inline schema is not valid JSON.",
+            message="The schema JSON is not valid JSON.",
             internal_message=str(e),
             failure_type=FailureType.config_error,
         ) from e
     if not isinstance(parsed, dict):
-        raise AirbyteTracedException(message="The inline schema must be a JSON object.", failure_type=FailureType.config_error)
+        raise AirbyteTracedException(message="The schema JSON must be an object.", failure_type=FailureType.config_error)
     out: TableSchemas = {}
     for component, tables in parsed.items():
         if not isinstance(tables, dict):
             raise AirbyteTracedException(
-                message=f"Inline schema entry {component!r} must map table names to JSON Schemas.",
+                message=f"Schema entry {component!r} must map table names to Convex validators (or null).",
                 failure_type=FailureType.config_error,
             )
-        if _looks_like_bare_schema(tables):
+        if isinstance(tables.get("type"), str) and "value" in tables:
             raise AirbyteTracedException(
                 message=(
-                    f"Inline schema entry {component!r} looks like a table schema. Wrap root tables under the empty "
-                    f'component path: {{"": {{"{component}": <JSON Schema>}}}}.'
+                    f"Schema entry {component!r} looks like a table validator. Wrap root tables under the empty "
+                    f'component path: {{"": {{"{component}": <validator>}}}}.'
                 ),
                 failure_type=FailureType.config_error,
             )
-        for table, schema in tables.items():
-            if not isinstance(schema, dict):
+        for table, validator in tables.items():
+            if validator is not None and not isinstance(validator, dict):
                 raise AirbyteTracedException(
-                    message=f"Schema for table {component!r}/{table!r} must be a JSON Schema object.",
+                    message=f"Schema for table {component!r}/{table!r} must be a Convex validator object or null.",
                     failure_type=FailureType.config_error,
                 )
-            out[(component, table)] = schema
+            out[(component, table)] = validator
     return out
 
 
-def schemas_from_api(client: ConvexClient) -> TableSchemas:
-    return {(component, table): schema for component, tables in client.json_schemas().items() for table, schema in tables.items()}
-
-
-def airbyte_schema_for(table_schema: Mapping[str, Any]) -> Dict[str, Any]:
-    """Copy the table schema, add system + CDC fields, and relax ``additionalProperties``."""
+def airbyte_schema_for(validator: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    """Stream schema for a table: its validator as JSON Schema (or nothing, for schema-less tables) plus system + CDC fields."""
     schema: Dict[str, Any] = {"$schema": "http://json-schema.org/draft-07/schema#", "type": "object"}
+    table_schema = validator_to_json_schema(validator) if validator is not None else {}
     branches = table_schema.get("anyOf")
     if isinstance(branches, list):
         # Union document types: merge every branch's properties into one permissive schema.
@@ -324,10 +361,10 @@ class ConvexTableStream(Stream):
     primary_key = "_id"
     cursor_field = "_ts"
 
-    def __init__(self, component: str, table: str, json_schema: Mapping[str, Any]):
+    def __init__(self, component: str, table: str, validator: Optional[Mapping[str, Any]]):
         self.component = component
         self.table = table
-        self._json_schema = with_convex_origin(airbyte_schema_for(json_schema), component, table)
+        self._json_schema = with_convex_origin(airbyte_schema_for(validator), component, table)
 
     @property
     def name(self) -> str:
@@ -469,45 +506,33 @@ class SourceConvexDataSync(AbstractSource):
             timeout=int(config.get("request_timeout_seconds", DEFAULT_REQUEST_TIMEOUT_SECONDS)),
         )
 
-    # -- spec helpers -----------------------------------------------------
+    # -- schema -----------------------------------------------------------
 
     @staticmethod
-    def _schema_source(config: Mapping[str, Any]) -> Mapping[str, Any]:
-        return config.get("schema_source") or {"type": "api"}
-
-    def _table_schemas(self, config: Mapping[str, Any], client: ConvexClient) -> TableSchemas:
-        source = self._schema_source(config)
-        kind = source.get("type", "api")
-        if kind == "inline":
-            return parse_inline_schema(source.get("schema_json") or "")
-        if kind == "api":
-            return schemas_from_api(client)
-        raise AirbyteTracedException(message=f"Unknown schema_source type {kind!r}.", failure_type=FailureType.config_error)
+    def _table_schemas(config: Mapping[str, Any]) -> TableSchemas:
+        return parse_schema_json(config.get("schema_json") or "")
 
     # -- check / discover -------------------------------------------------
 
     def check_connection(self, logger: logging.Logger, config: Mapping[str, Any]) -> Tuple[bool, Any]:
         client = self._client(config)
         try:
+            streams = self._streams(config)
             client.list_active_syncs()
-            streams = self._streams(config, client)
         except AirbyteTracedException as e:
             return False, e.message
         except ConvexApiError as e:
             return False, str(e)
         if not streams:
-            return False, "No tables found. Check the deployment URL, the deploy key, and the schema source."
+            return False, "The schema JSON lists no tables."
         return True, None
 
     def streams(self, config: Mapping[str, Any]) -> List[Stream]:
-        return self._streams(config, self._client(config))
+        return list(self._streams(config))
 
-    def _streams(self, config: Mapping[str, Any], client: ConvexClient) -> List[ConvexTableStream]:
-        try:
-            schemas = self._table_schemas(config, client)
-        except ConvexApiError as e:
-            raise e.as_traced() from e
-        streams = [ConvexTableStream(component, table, schema) for (component, table), schema in sorted(schemas.items())]
+    def _streams(self, config: Mapping[str, Any]) -> List[ConvexTableStream]:
+        schemas = self._table_schemas(config)
+        streams = [ConvexTableStream(component, table, validator) for (component, table), validator in sorted(schemas.items())]
         seen: Dict[str, ConvexTableStream] = {}
         for stream in streams:
             other = seen.setdefault(stream.name, stream)
@@ -515,7 +540,7 @@ class SourceConvexDataSync(AbstractSource):
                 raise AirbyteTracedException(
                     message=(
                         f"Tables {other.component or '<root>'}/{other.table} and {stream.component or '<root>'}/{stream.table} "
-                        f"both map to the Airbyte stream name {stream.name!r}. Rename one of them or exclude it with an inline schema."
+                        f"both map to the Airbyte stream name {stream.name!r}. Rename one of them or drop it from the schema JSON."
                     ),
                     failure_type=FailureType.config_error,
                 )
@@ -540,7 +565,7 @@ class SourceConvexDataSync(AbstractSource):
         checkpoint_pages = int(config.get("state_checkpoint_pages") or STATE_CHECKPOINT_PAGES)
 
         # Resolve every configured stream to its (component, table) against what the deployment exposes now.
-        known = self._known_streams(logger, config, client, configured)
+        known = {stream.name: (stream.component, stream.table) for stream in self._streams(config)}
         pair_to_name: Dict[Tuple[str, str], str] = {}
         for name, cs in configured.items():
             pair = self._pair_for(cs, known)
@@ -710,31 +735,6 @@ class SourceConvexDataSync(AbstractSource):
                 ", ".join(f"{c or '<root>'}/{t}={n}" for (c, t), n in sorted(dropped.items())),
             )
         logger.info("Convex data sync %s: %d pages, %d records, status=%s", sync_state.sync_id, pages, records, status_type or "none")
-
-    def _known_streams(
-        self,
-        logger: logging.Logger,
-        config: Mapping[str, Any],
-        client: ConvexClient,
-        configured: Mapping[str, ConfiguredAirbyteStream],
-    ) -> Dict[str, Tuple[str, str]]:
-        """Stream name -> (component, table) as the deployment exposes them now.
-
-        Schema discovery is a hard dependency of discover, but a read should not fail because one unrelated
-        table cannot be described. When every configured stream carries the origin hint discover wrote, fall
-        back to those hints and let Convex validate the selection.
-        """
-        try:
-            return {stream.name: (stream.component, stream.table) for stream in self._streams(config, client)}
-        except AirbyteTracedException as e:
-            hinted: Dict[str, Tuple[str, str]] = {}
-            for name, cs in configured.items():
-                schema = cs.stream.json_schema or {}
-                if "x-convex-table" not in schema:
-                    raise
-                hinted[name] = (schema.get("x-convex-component", ROOT_COMPONENT), schema["x-convex-table"])
-            logger.warning("Could not fetch table schemas (%s); syncing the configured streams from their saved schemas.", e.message)
-            return hinted
 
     @staticmethod
     def _pair_for(configured_stream: ConfiguredAirbyteStream, known: Mapping[str, Tuple[str, str]]) -> Optional[Tuple[str, str]]:

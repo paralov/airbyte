@@ -18,58 +18,42 @@ from airbyte_cdk.models import (
 DEPLOYMENT_URL = "https://murky-swan-635.convex.cloud"
 SYNC_URL = f"{DEPLOYMENT_URL}/api/v1/data/sync"
 ACTIVE_SYNCS_URL = f"{DEPLOYMENT_URL}/api/v1/data/list_active_syncs"
-JSON_SCHEMAS_URL = f"{DEPLOYMENT_URL}/api/json_schemas"
 
-POSTS_SCHEMA = {
-    "$schema": "http://json-schema.org/draft-07/schema#",
-    "type": "object",
-    "properties": {
-        "_id": {"type": "string", "$description": "Id(posts)"},
-        "_creationTime": {"type": "number"},
-        "author": {"type": "string", "$description": "Id(users)"},
-        "body": {"type": "string"},
-    },
-    "required": ["_id", "_creationTime", "author", "body"],
-    "additionalProperties": False,
+
+def obj(fields):
+    return {"type": "object", "value": {name: {"fieldType": ft, "optional": opt} for name, (ft, opt) in fields.items()}}
+
+
+POSTS_VALIDATOR = obj(
+    {
+        "author": ({"type": "id", "tableName": "users"}, False),
+        "body": ({"type": "string"}, False),
+    }
+)
+
+USER_VALIDATOR = obj(
+    {
+        "email": ({"type": "string"}, False),
+        "name": ({"type": "union", "value": [{"type": "null"}, {"type": "string"}]}, True),
+    }
+)
+
+RATE_LIMITS_VALIDATOR = obj({"name": ({"type": "string"}, False), "value": ({"type": "number"}, False)})
+
+SCHEMA = {
+    "": {"posts": POSTS_VALIDATOR},
+    "betterAuth": {"user": USER_VALIDATOR},
+    "resend/rateLimiter": {"rateLimits": RATE_LIMITS_VALIDATOR},
 }
 
-USER_SCHEMA = {
-    "$schema": "http://json-schema.org/draft-07/schema#",
-    "type": "object",
-    "properties": {
-        "_id": {"type": "string"},
-        "_creationTime": {"type": "number"},
-        "email": {"type": "string"},
-        "name": {"type": "string"},
-    },
-    "required": ["_id", "_creationTime", "email"],
-    "additionalProperties": False,
-}
-
-RATE_LIMITS_SCHEMA = {
-    "type": "object",
-    "properties": {"_id": {"type": "string"}, "_creationTime": {"type": "number"}, "name": {"type": "string"}, "value": {"type": "number"}},
-}
-
-INLINE_SCHEMA = {
-    "": {"posts": POSTS_SCHEMA},
-    "betterAuth": {"user": USER_SCHEMA},
-    "resend/rateLimiter": {"rateLimits": RATE_LIMITS_SCHEMA},
-}
-
-
-@pytest.fixture
-def api_config():
-    return {"deployment_url": DEPLOYMENT_URL, "access_key": "test_api_key", "schema_source": {"type": "api"}}
+POSTS_SCHEMA = {"type": "object", "properties": {"_id": {"type": "string"}, "author": {"type": "string"}, "body": {"type": "string"}}}
+USER_SCHEMA = {"type": "object", "properties": {"_id": {"type": "string"}, "email": {"type": "string"}, "name": {"type": "string"}}}
+RATE_LIMITS_SCHEMA = {"type": "object", "properties": {"_id": {"type": "string"}, "name": {"type": "string"}, "value": {"type": "number"}}}
 
 
 @pytest.fixture
 def inline_config():
-    return {
-        "deployment_url": DEPLOYMENT_URL,
-        "access_key": "test_api_key",
-        "schema_source": {"type": "inline", "schema_json": json.dumps(INLINE_SCHEMA)},
-    }
+    return {"deployment_url": DEPLOYMENT_URL, "access_key": "test_api_key", "schema_json": json.dumps(SCHEMA)}
 
 
 def configured_stream(name, component, table, schema, sync_mode=SyncMode.incremental):

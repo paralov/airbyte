@@ -7,6 +7,7 @@ connectionSpecification:
   required:
     - deployment_url
     - access_key
+    - schema_json
   properties:
     deployment_url:
       type: string
@@ -22,39 +23,16 @@ connectionSpecification:
       description: A deploy key with the deployment:data:view permission. Streaming export requires a Convex Pro plan.
       airbyte_secret: true
       order: 1
-    schema_source:
-      type: object
-      title: Table Schemas
+    schema_json:
+      type: string
+      title: Table Schemas (Convex validator JSON)
       description: >-
-        Where to get JSON Schemas for the tables. "Fetch from deployment" asks the deployment for the schema of
-        every table, including tables inside installed components. Use an inline schema to pin schemas or to sync
-        only some tables. The inline format is {"<component path>": {"<table>": <JSON Schema>}}, with "" for the
-        root component.
+        Which tables to sync and their schemas, as {"<component path>": {"<table>": <Convex validator JSON> | null}}
+        with "" for the root component. A validator is the .json form of v.object({...}) from convex/values, the
+        same thing npx convex dev pushes to your deployment. Use null for a table without a schema. Generate this
+        from your convex.config.ts and schema.ts files; see the connector documentation.
+      multiline: true
       order: 2
-      oneOf:
-        - title: Fetch from deployment
-          required:
-            - type
-          properties:
-            type:
-              type: string
-              const: api
-              order: 0
-        - title: Inline JSON
-          required:
-            - type
-            - schema_json
-          properties:
-            type:
-              type: string
-              const: inline
-              order: 0
-            schema_json:
-              type: string
-              title: Schema JSON
-              description: JSON object mapping component paths to tables to JSON Schemas.
-              multiline: true
-              order: 1
     max_pages_per_sync:
       type: integer
       title: Max Pages Per Sync

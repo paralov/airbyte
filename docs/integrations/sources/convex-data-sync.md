@@ -37,22 +37,21 @@ Values that JSON cannot represent are encoded as described in the
 
 ### Table schemas
 
-Airbyte needs a JSON Schema for each stream. The connector can get it two ways, chosen with the
-"Table Schemas" option:
+Schemas are opt-in in Convex, so the connector never asks the deployment for one. You tell it which tables
+to sync and what they look like, in Convex's own terms: the "Table Schemas" field takes a JSON object of the
+form `{"<component path>": {"<table>": <Convex validator JSON> | null}}`, with `""` as the root component
+path. A validator is the `.json` form of the table's `v.object({...})` from `convex/values`, exactly what
+`npx convex dev` pushes to your deployment. The connector converts it to JSON Schema for Airbyte.
 
-- **Fetch from deployment** asks the deployment for the schema of every table, including tables
-  inside installed components. For tables without a schema the deployment infers one from the
-  documents' shape; the request fails if any table's documents cannot be described as a single
-  object shape, in which case use an inline schema. Because every sync re-fetches the schemas to
-  check that the selected tables still exist, such a table breaks every sync of the connection, not
-  only discovery.
-- **Inline JSON** takes a JSON object of the form `{"<component path>": {"<table>": <JSON Schema>}}`,
-  with `""` as the root component path. Use this to pin schemas or to expose only some tables. You
-  can generate the object from your `convex.config.ts` and each component's `schema.ts` with a small
-  script that reads every table validator's `.json` representation and converts it to JSON Schema.
+- Tables you leave out are not synced.
+- Use `null` for a table that exists without a schema. It gets a permissive stream schema (system fields
+  typed, everything else allowed).
+- Int64 and bytes fields arrive in Convex's JSON encoding, for example `{"$integer": "<base64>"}`.
 
-Two tables that map to the same stream name (for example a root table `audit__log` and a table `log`
-inside a component `audit`) are rejected; rename one of them or leave it out of an inline schema.
+To generate the object, walk your `convex.config.ts` for installed components and read every table's
+`validator.json` from each `schema.ts`. A small script that does this lives alongside your app; run it on
+the commit that is deployed and paste the output into the connector configuration. Re-run it after schema
+changes and refresh the source schema in Airbyte.
 
 ### State and sync behaviour
 
@@ -70,8 +69,6 @@ one. Consequences:
 - If the saved cursor does not belong to the deployment (for example after changing the deployment URL),
   the sync fails with a configuration error instead of piling a fresh snapshot onto the old rows. Clear the
   connection's data and sync again.
-- If table schemas cannot be fetched at sync time, the connector falls back to the schemas saved in the
-  connection, as long as every stream was set up through discover.
 - A Full Refresh stream is only complete once the sync is up to date. If "Max Pages Per Sync" stops
   the run before that, the stream is reported incomplete (the destination keeps its previous data)
   and the next run continues its snapshot; tombstones are never emitted into Full Refresh streams.
@@ -81,7 +78,7 @@ one. Consequences:
 - A sync stops at the first page on which Convex reports the export is up to date; that page is a
   consistent snapshot of every selected table. Set "Max Pages Per Sync" to bound very large initial
   syncs; the next run resumes from the saved cursor.
-- A stream that is still in the connection but no longer in the deployment (or the inline schema) is
+- A stream that is still in the connection but no longer in the table schemas is
   skipped with a warning; refresh the source schema to remove it.
 
 ### Features
@@ -119,7 +116,7 @@ Only "Production" deployments should be synced.
 2. Copy the "Deployment URL" from the settings page to the `deployment_url` field in Airbyte.
 3. Click "Generate a deploy key" and grant it `deployment:data:view`.
 4. Copy the generated deploy key into the `access_key` field in Airbyte.
-5. Choose a schema source. "Fetch from deployment" covers root and component tables.
+5. Paste the generated table schemas into the "Table Schemas" field.
 
 ## Changelog
 
@@ -128,6 +125,6 @@ Only "Production" deployments should be synced.
 
 | Version | Date       | Pull Request                                             | Subject                                                          |
 | :------ | :--------- | :------------------------------------------------------- | :--------------------------------------------------------------- |
-| 0.1.0 | 2026-09-04 | [1](https://github.com/paralov/airbyte/pull/1) | New connector on the Convex Deployment API data sync endpoint: one resumable cursor, component tables as streams, inline schema option |
+| 0.1.0 | 2026-09-04 | [1](https://github.com/paralov/airbyte/pull/1) | New connector on the Convex Deployment API data sync endpoint: one resumable cursor, component tables as streams, schemas supplied as Convex validator JSON |
 
 </details>
