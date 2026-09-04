@@ -63,8 +63,11 @@ COMPONENT_SEPARATOR = "__"
 # ``pagination.hasMore`` is documented as always true, so ``upToDate`` is the only completion signal.
 UP_TO_DATE_STATUS = "upToDate"
 
-# Error codes that mean the cursor is unusable and the sync must restart.
-RESTART_ERROR_CODES = {"DataSyncCursorExpired", "InvalidDataSyncCursor"}
+# The sync went unused for more than 3 days: Convex forgot it, so restart from scratch.
+RESTART_ERROR_CODES = {"DataSyncCursorExpired"}
+# The saved cursor does not belong to this deployment (for example deployment_url was
+# changed). Restarting would layer a fresh snapshot on top of the old rows, so refuse.
+FOREIGN_CURSOR_ERROR_CODES = {"InvalidDataSyncCursor"}
 
 # Responses that mean the request itself is wrong (bad URL, key, plan or selection) rather than transient.
 CONFIG_ERROR_STATUS_CODES = {400, 401, 403, 404}
@@ -537,7 +540,7 @@ class SourceConvexDataSync(AbstractSource):
         checkpoint_pages = int(config.get("state_checkpoint_pages") or STATE_CHECKPOINT_PAGES)
 
         # Resolve every configured stream to its (component, table) against what the deployment exposes now.
-        known = {stream.name: (stream.component, stream.table) for stream in self._streams(config, client)}
+        known = self._known_streams(logger, config, client, configured)
         pair_to_name: Dict[Tuple[str, str], str] = {}
         for name, cs in configured.items():
             pair = self._pair_for(cs, known)
@@ -606,6 +609,15 @@ class SourceConvexDataSync(AbstractSource):
                 try:
                     page = client.data_sync(sync_state.cursor, selection)
                 except ConvexApiError as e:
+                    if e.code in FOREIGN_CURSOR_ERROR_CODES and sync_state.cursor is not None:
+                        raise AirbyteTracedException(
+                            message=(
+                                "Convex rejected the saved sync cursor. This usually means the deployment URL changed since the "
+                                "last sync. Clear the connection's data so the new deployment is synced from scratch."
+                            ),
+                            internal_message=str(e),
+                            failure_type=FailureType.config_error,
+                        ) from e
                     if e.code in RESTART_ERROR_CODES and sync_state.cursor is not None and not restarted:
                         logger.warning(
                             "Convex rejected the saved cursor (%s); restarting the data sync from scratch. Every table will be re-sent "
@@ -698,6 +710,31 @@ class SourceConvexDataSync(AbstractSource):
                 ", ".join(f"{c or '<root>'}/{t}={n}" for (c, t), n in sorted(dropped.items())),
             )
         logger.info("Convex data sync %s: %d pages, %d records, status=%s", sync_state.sync_id, pages, records, status_type or "none")
+
+    def _known_streams(
+        self,
+        logger: logging.Logger,
+        config: Mapping[str, Any],
+        client: ConvexClient,
+        configured: Mapping[str, ConfiguredAirbyteStream],
+    ) -> Dict[str, Tuple[str, str]]:
+        """Stream name -> (component, table) as the deployment exposes them now.
+
+        Schema discovery is a hard dependency of discover, but a read should not fail because one unrelated
+        table cannot be described. When every configured stream carries the origin hint discover wrote, fall
+        back to those hints and let Convex validate the selection.
+        """
+        try:
+            return {stream.name: (stream.component, stream.table) for stream in self._streams(config, client)}
+        except AirbyteTracedException as e:
+            hinted: Dict[str, Tuple[str, str]] = {}
+            for name, cs in configured.items():
+                schema = cs.stream.json_schema or {}
+                if "x-convex-table" not in schema:
+                    raise
+                hinted[name] = (schema.get("x-convex-component", ROOT_COMPONENT), schema["x-convex-table"])
+            logger.warning("Could not fetch table schemas (%s); syncing the configured streams from their saved schemas.", e.message)
+            return hinted
 
     @staticmethod
     def _pair_for(configured_stream: ConfiguredAirbyteStream, known: Mapping[str, Tuple[str, str]]) -> Optional[Tuple[str, str]]:

@@ -67,6 +67,11 @@ one. Consequences:
   re-sends everything. Incremental Dedupe destinations absorb the re-sent rows, but rows deleted
   while the cursor was expired are not tombstoned, so reset the streams in the destination if you
   need an exact mirror.
+- If the saved cursor does not belong to the deployment (for example after changing the deployment URL),
+  the sync fails with a configuration error instead of piling a fresh snapshot onto the old rows. Clear the
+  connection's data and sync again.
+- If table schemas cannot be fetched at sync time, the connector falls back to the schemas saved in the
+  connection, as long as every stream was set up through discover.
 - A Full Refresh stream is only complete once the sync is up to date. If "Max Pages Per Sync" stops
   the run before that, the stream is reported incomplete (the destination keeps its previous data)
   and the next run continues its snapshot; tombstones are never emitted into Full Refresh streams.
