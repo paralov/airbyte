@@ -41,7 +41,11 @@ Airbyte needs a JSON Schema for each stream. The connector can get it two ways, 
 "Table Schemas" option:
 
 - **Fetch from deployment** asks the deployment for the schema of every table, including tables
-  inside installed components. Tables without a schema get a permissive schema.
+  inside installed components. For tables without a schema the deployment infers one from the
+  documents' shape; the request fails if any table's documents cannot be described as a single
+  object shape, in which case use an inline schema. Because every sync re-fetches the schemas to
+  check that the selected tables still exist, such a table breaks every sync of the connection, not
+  only discovery.
 - **Inline JSON** takes a JSON object of the form `{"<component path>": {"<table>": <JSON Schema>}}`,
   with `""` as the root component path. Use this to pin schemas or to expose only some tables. You
   can generate the object from your `convex.config.ts` and each component's `schema.ts` with a small
@@ -60,7 +64,12 @@ one. Consequences:
 - A Full Refresh stream, or a stream whose data you cleared in Airbyte, is deselected for one page
   and reselected, which makes Convex re-send it in full. Other streams keep streaming changes.
 - The cursor expires after 3 days without a sync. The connector then restarts from scratch and
-  re-sends everything; Incremental Dedupe destinations absorb this.
+  re-sends everything. Incremental Dedupe destinations absorb the re-sent rows, but rows deleted
+  while the cursor was expired are not tombstoned, so reset the streams in the destination if you
+  need an exact mirror.
+- A Full Refresh stream is only complete once the sync is up to date. If "Max Pages Per Sync" stops
+  the run before that, the stream is reported incomplete (the destination keeps its previous data)
+  and the next run continues its snapshot; tombstones are never emitted into Full Refresh streams.
 - If Convex truncates a table (for example after `npx convex import --replace`), the connector logs
   a warning and the table is re-sent in full. Rows deleted by the truncate are not tombstoned, so
   reset that stream in the destination if you need an exact mirror.

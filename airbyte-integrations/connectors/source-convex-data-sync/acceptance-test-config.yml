@@ -15,22 +15,23 @@ acceptance_tests:
   discovery:
     tests:
       - config_path: "secrets/config.json"
-  # TODO: Need creds to run integration tests https://github.com/airbytehq/airbyte/issues/25571
+  # TODO: needs credentials for a deployment with the tables in integration_tests/configured_catalog.json.
   # basic_read:
   #   tests:
   #     - config_path: "secrets/config.json"
   #       configured_catalog_path: "integration_tests/configured_catalog.json"
-  #       empty_streams:
-  #         - name: "users"
-  #           bypass_reason: "No records provided"
-  #         - name: "posts"
-  #           bypass_reason: "No records provided"
+  #       expect_records:
+  #         path: "integration_tests/expected_records.jsonl"
+  # The incremental suite's future-state test expects zero records for abnormal_state.json, but Convex answers an
+  # unknown cursor with InvalidDataSyncCursor and this connector then restarts the sync from scratch, so that test
+  # needs a bypass_reason when the suite is enabled.
   # incremental:
   #   tests:
   #     - config_path: "secrets/config.json"
   #       configured_catalog_path: "integration_tests/configured_catalog.json"
   #       future_state:
   #         future_state_path: "integration_tests/abnormal_state.json"
+  #         bypass_reason: "An unknown cursor restarts the data sync from scratch instead of returning no records."
   # full_refresh:
   #   tests:
   #     - config_path: "secrets/config.json"

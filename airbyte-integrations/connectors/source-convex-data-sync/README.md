@@ -22,7 +22,7 @@ poetry install --with dev
 **If you are a community contributor**, follow the instructions in the [documentation](https://docs.airbyte.com/integrations/sources/convex-data-sync)
 to generate the necessary credentials. Then create a file `secrets/config.json` conforming to the `source_convex_data_sync/spec.yaml` file.
 Note that any directory named `secrets` is gitignored across the entire Airbyte repo, so there is no danger of accidentally checking in sensitive information.
-See `sample_files/sample_config.json` for a sample config file.
+See `integration_tests/sample_config.json` for a sample config file.
 
 
 ### Locally running the connector
@@ -30,7 +30,7 @@ See `sample_files/sample_config.json` for a sample config file.
 poetry run source-convex-data-sync spec
 poetry run source-convex-data-sync check --config secrets/config.json
 poetry run source-convex-data-sync discover --config secrets/config.json
-poetry run source-convex-data-sync read --config secrets/config.json --catalog sample_files/configured_catalog.json
+poetry run source-convex-data-sync read --config secrets/config.json --catalog integration_tests/configured_catalog.json
 ```
 
 ### Running unit tests
@@ -84,7 +84,7 @@ You've checked out the repo, implemented a million dollar feature, and you're re
     - bump the `dockerImageTag` value in in `metadata.yaml`
     - bump the `version` value in `pyproject.toml`
 3. Make sure the `metadata.yaml` content is up to date.
-4. Make sure the connector documentation and its changelog is up to date (`docs/integrations/sources/convex.md`).
+4. Make sure the connector documentation and its changelog is up to date (`docs/integrations/sources/convex-data-sync.md`).
 5. Create a Pull Request: use [our PR naming conventions](https://docs.airbyte.com/contributing-to-airbyte/resources/pull-requests-handbook/#pull-request-title-convention).
 6. Pat yourself on the back for being an awesome contributor.
 7. Someone from Airbyte will take a look at your PR and iterate with you to merge it into master.

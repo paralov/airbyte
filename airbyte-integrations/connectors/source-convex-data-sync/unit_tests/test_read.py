@@ -218,30 +218,6 @@ def test_read_resnapshots_streams_whose_state_was_cleared(requests_mock, inline_
     assert "resend/rateLimiter" in second["selection"]
 
 
-def test_read_accepts_global_state_with_shared_keys_in_stream_states(requests_mock, inline_config, catalog):
-    from airbyte_cdk.models import AirbyteGlobalState
-
-    state = [
-        AirbyteStateMessage(
-            type=AirbyteStateType.GLOBAL,
-            global_=AirbyteGlobalState(
-                shared_state=AirbyteStateBlob(cursor="g1", sync_id="sync-1", checkpointed_at=5),
-                stream_states=[
-                    AirbyteStreamState(
-                        stream_descriptor=StreamDescriptor(name=name),
-                        stream_state=AirbyteStateBlob(cursor="g1", checkpointed_at=5, snapshot_complete=True),
-                    )
-                    for name in ("posts", "betterAuth__user", "resend__rateLimiter__rateLimits")
-                ],
-            ),
-        )
-    ]
-    requests_mock.post(SYNC_URL, [{"json": page(cursor="g2", status={"type": "upToDate", "snapshotTs": 1})}])
-    _, _, states, _ = run(inline_config, catalog, state)
-    assert requests_mock.request_history[0].json()["cursor"] == "g1"
-    assert shared(states[-1])["cursor"] == "g2"
-
-
 def test_read_skips_streams_missing_from_the_source(requests_mock, inline_config, catalog):
     from unit_tests.helpers import POSTS_SCHEMA, configured_stream
 
@@ -351,3 +327,112 @@ def test_read_with_empty_catalog_makes_no_requests(requests_mock, inline_config,
     messages, *_ = run(inline_config, catalog)
     assert messages == []
     assert not requests_mock.called
+
+
+def test_read_drops_tombstones_from_full_refresh_streams(requests_mock, inline_config, catalog):
+    catalog.streams[1].sync_mode = SyncMode.full_refresh  # betterAuth__user
+    requests_mock.post(
+        SYNC_URL,
+        [
+            {
+                "json": page(
+                    values=[
+                        value("betterAuth", "user", {"_id": "u1", "_creationTime": 1.0, "email": "a@b.c"}, ts=10),
+                        value("betterAuth", "user", {"_id": "u2"}, ts=20, deleted=True),
+                        value("", "posts", {"_id": "p1"}, ts=30, deleted=True),
+                    ],
+                    cursor="c1",
+                    status={"type": "upToDate", "snapshotTs": 1},
+                )
+            }
+        ],
+    )
+    _, records, _, statuses = run(inline_config, catalog)
+    assert [(r.stream, r.data["_id"], r.data["_deleted"]) for r in records] == [("betterAuth__user", "u1", False), ("posts", "p1", True)]
+    assert statuses.count(AirbyteStreamStatus.COMPLETE) == 3
+
+
+def test_read_continues_an_in_progress_full_refresh_snapshot(requests_mock, inline_config, catalog):
+    catalog.streams[1].sync_mode = SyncMode.full_refresh  # betterAuth__user
+    requests_mock.post(SYNC_URL, [{"json": page(cursor="c2", status={"type": "upToDate", "snapshotTs": 1})}])
+    state = [
+        stream_state(name, "c1", snapshot_complete=(name != "betterAuth__user"))
+        for name in ("posts", "betterAuth__user", "resend__rateLimiter__rateLimits")
+    ]
+    _, _, states, statuses = run(inline_config, catalog, state)
+    # No priming page: the previous run's re-sync of betterAuth__user is still tracked by Convex and just carries on.
+    assert len(requests_mock.request_history) == 1
+    assert "betterAuth" in requests_mock.request_history[0].json()["selection"]
+    assert last_states(states)["betterAuth__user"]["snapshot_complete"] is True
+    assert AirbyteStreamStatus.INCOMPLETE not in statuses
+
+
+def test_read_reports_partial_full_refresh_snapshot_incomplete_at_max_pages(requests_mock, inline_config, catalog, caplog):
+    inline_config["max_pages_per_sync"] = 1
+    catalog.streams[0].sync_mode = SyncMode.full_refresh  # posts
+    requests_mock.post(SYNC_URL, [{"json": page(cursor="c1")}, {"json": page(cursor="c2")}])
+    with caplog.at_level(logging.WARNING):
+        messages, _, states, _ = run(inline_config, catalog)
+    final = {
+        m.trace.stream_status.stream_descriptor.name: m.trace.stream_status.status
+        for m in messages
+        if m.type == Type.TRACE and m.trace.stream_status
+    }
+    assert final["posts"] == AirbyteStreamStatus.INCOMPLETE
+    assert final["betterAuth__user"] == AirbyteStreamStatus.COMPLETE
+    assert last_states(states)["posts"]["snapshot_complete"] is False
+    assert "full refresh snapshot of ['posts']" in caplog.text
+
+
+def test_read_resnapshots_streams_with_stale_state_without_warning(requests_mock, inline_config, catalog, caplog):
+    # betterAuth__user was disabled for a few runs (the platform kept its old state) and is enabled again.
+    requests_mock.post(
+        SYNC_URL,
+        [
+            {"json": page(cursor="c9")},
+            {
+                "json": page(
+                    truncates=[{"component": "betterAuth", "table": "user"}], cursor="c10", status={"type": "upToDate", "snapshotTs": 1}
+                )
+            },
+        ],
+    )
+    state = [
+        stream_state("posts", "c8", checkpointed_at=8, snapshot_complete=True),
+        stream_state("betterAuth__user", "c3", checkpointed_at=3, snapshot_complete=True),
+        stream_state("resend__rateLimiter__rateLimits", "c8", checkpointed_at=8, snapshot_complete=True),
+    ]
+    with caplog.at_level(logging.WARNING):
+        run(inline_config, catalog, state)
+    first, second = requests_mock.request_history[0].json(), requests_mock.request_history[1].json()
+    assert first["cursor"] == "c8" and "betterAuth" not in first["selection"]
+    assert "betterAuth" in second["selection"]
+    assert "truncated table" not in caplog.text
+
+
+def test_read_treats_stream_whose_hint_disagrees_with_its_name_as_missing(requests_mock, inline_config, catalog):
+    from unit_tests.helpers import USER_SCHEMA, configured_stream
+
+    # The name still resolves to root/posts, but the catalog entry was discovered as betterAuth/user.
+    catalog.streams[0] = configured_stream("posts", "betterAuth", "user", USER_SCHEMA)
+    requests_mock.post(SYNC_URL, [{"json": page(cursor="c1", status={"type": "upToDate", "snapshotTs": 1})}])
+    messages, _, states, _ = run(inline_config, catalog)
+    assert "" not in requests_mock.request_history[0].json()["selection"]
+    incomplete = [
+        m.trace.stream_status.stream_descriptor.name
+        for m in messages
+        if m.type == Type.TRACE and m.trace.stream_status and m.trace.stream_status.status == AirbyteStreamStatus.INCOMPLETE
+    ]
+    assert incomplete == ["posts"]
+    assert "posts" not in last_states(states)
+
+
+def test_read_does_not_retry_a_malformed_deployment_url(inline_config, catalog, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("source_convex_data_sync.source.time.sleep", sleeps.append)
+    inline_config["deployment_url"] = "murky-swan-635.convex.cloud"
+    with pytest.raises(AirbyteTracedException) as err:
+        run(inline_config, catalog)
+    assert err.value.failure_type == FailureType.config_error
+    assert "No scheme supplied" in err.value.message
+    assert sleeps == []

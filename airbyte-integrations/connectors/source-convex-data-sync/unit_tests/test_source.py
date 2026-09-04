@@ -118,15 +118,32 @@ def test_streams_from_api(requests_mock, api_config):
     assert requests_mock.last_request.qs == {"deltaschema": ["true"], "format": ["export_json"], "bycomponent": ["true"]}
 
 
+COLLIDING_CONFIG = {
+    "deployment_url": "https://murky-swan-635.convex.cloud",
+    "access_key": "k",
+    "schema_source": {"type": "inline", "schema_json": json.dumps({"": {"audit__log": POSTS_SCHEMA}, "audit": {"log": USER_SCHEMA}})},
+}
+
+
 def test_streams_rejects_colliding_stream_names():
-    config = {
-        "deployment_url": "https://murky-swan-635.convex.cloud",
-        "access_key": "k",
-        "schema_source": {"type": "inline", "schema_json": json.dumps({"": {"audit__log": POSTS_SCHEMA}, "audit": {"log": USER_SCHEMA}})},
-    }
     with pytest.raises(AirbyteTracedException) as err:
-        SourceConvexDataSync().streams(config)
+        SourceConvexDataSync().streams(COLLIDING_CONFIG)
     assert "audit__log" in err.value.message
+
+
+def test_check_connection_reports_colliding_stream_names(requests_mock):
+    requests_mock.get(ACTIVE_SYNCS_URL, json={"syncs": [], "pagination": {"hasMore": False}})
+    ok, error = SourceConvexDataSync().check_connection(logger, COLLIDING_CONFIG)
+    assert not ok and "audit__log" in error
+
+
+def test_check_connection_rejects_malformed_deployment_url(inline_config, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("source_convex_data_sync.source.time.sleep", sleeps.append)
+    inline_config["deployment_url"] = "murky-swan-635.convex.cloud"
+    ok, error = SourceConvexDataSync().check_connection(logger, inline_config)
+    assert not ok and "No scheme supplied" in error
+    assert sleeps == []
 
 
 def test_discover_catalog(inline_config):

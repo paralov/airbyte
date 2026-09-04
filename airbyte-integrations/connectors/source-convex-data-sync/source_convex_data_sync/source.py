@@ -69,6 +69,13 @@ RESTART_ERROR_CODES = {"DataSyncCursorExpired", "InvalidDataSyncCursor"}
 # Responses that mean the request itself is wrong (bad URL, key, plan or selection) rather than transient.
 CONFIG_ERROR_STATUS_CODES = {400, 401, 403, 404}
 
+# Raised by ``requests`` before any network I/O: retrying cannot help and the deployment URL is wrong.
+NON_RETRYABLE_REQUEST_ERRORS = (
+    requests.exceptions.InvalidSchema,
+    requests.exceptions.InvalidURL,
+    requests.exceptions.MissingSchema,
+)
+
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 120
 MAX_ATTEMPTS = 5
 MAX_BACKOFF_SECONDS = 30
@@ -110,14 +117,17 @@ def stream_name_for(component: str, table: str) -> str:
 
 
 class ConvexApiError(Exception):
-    def __init__(self, context: str, status_code: int, code: Optional[str], message: str):
+    def __init__(self, context: str, status_code: int, code: Optional[str], message: str, failure_type: Optional[FailureType] = None):
         super().__init__(f"{context}: {status_code}: {code or 'error'}: {message}")
         self.status_code = status_code
         self.code = code
         self.message = message
+        self._failure_type = failure_type
 
     @property
     def failure_type(self) -> FailureType:
+        if self._failure_type is not None:
+            return self._failure_type
         return FailureType.config_error if self.status_code in CONFIG_ERROR_STATUS_CODES else FailureType.system_error
 
     def as_traced(self) -> AirbyteTracedException:
@@ -136,8 +146,11 @@ def _parse_error(resp: requests.Response) -> Tuple[Optional[str], str]:
 
 def _retry_delay(resp: requests.Response, attempt: int) -> float:
     retry_after = resp.headers.get("Retry-After")
-    if retry_after and retry_after.isdigit():
-        return min(float(retry_after), MAX_RETRY_AFTER_SECONDS)
+    if retry_after:
+        try:
+            return min(max(float(retry_after), 0.0), MAX_RETRY_AFTER_SECONDS)
+        except ValueError:
+            pass  # HTTP-date form; fall back to exponential backoff.
     return min(2**attempt, MAX_BACKOFF_SECONDS)
 
 
@@ -175,6 +188,8 @@ class ConvexClient:
             attempt += 1
             try:
                 resp = self.session.request(method, url, json=json_body, params=params, timeout=self.timeout)
+            except NON_RETRYABLE_REQUEST_ERRORS as e:
+                raise ConvexApiError(context, 0, "InvalidDeploymentUrl", str(e), failure_type=FailureType.config_error) from e
             except requests.RequestException as e:
                 if attempt >= MAX_ATTEMPTS:
                     raise ConvexApiError(context, 0, "RequestException", str(e)) from e
@@ -339,7 +354,10 @@ class SyncState:
     per-stream state messages (``message_utils.get_stream_descriptor`` rejects
     GLOBAL state), so the same cursor is written into every stream's state at each
     checkpoint along with a ``checkpointed_at`` stamp. On resume the most recently
-    checkpointed cursor wins.
+    checkpointed cursor wins, and only streams that took part in that checkpoint
+    keep their per-stream bookkeeping: a stream whose state is older (it was
+    deselected for a while, or its checkpoint was not persisted) is re-synced from
+    scratch, just like one whose state was cleared.
     """
 
     SHARED_KEYS = ("cursor", "sync_id", "selection_hash", "checkpointed_at")
@@ -359,28 +377,22 @@ class SyncState:
         out = cls()
         if not state:
             return out
-        candidates: List[Dict[str, Any]] = []
+        blobs: Dict[str, Dict[str, Any]] = {}
         for message in state:
             if message.type == AirbyteStateType.STREAM and message.stream is not None:
-                name = message.stream.stream_descriptor.name
                 blob = _blob_to_dict(message.stream.stream_state)
                 if "cursor" in blob:
-                    candidates.append(blob)
-                    out.streams[name] = cls._stream_keys(blob)
-            elif message.type == AirbyteStateType.GLOBAL and message.global_ is not None:
-                shared = _blob_to_dict(message.global_.shared_state)
-                if "cursor" in shared:
-                    candidates.append(shared)
-                for stream_state in message.global_.stream_states or []:
-                    name = stream_state.stream_descriptor.name
-                    out.streams[name] = cls._stream_keys(_blob_to_dict(stream_state.stream_state))
-        if not candidates:
+                    blobs[message.stream.stream_descriptor.name] = blob
+        if not blobs:
             logger.warning("No resumable Convex cursor in the incoming state; starting a fresh data sync.")
             return out
-        latest = max(candidates, key=lambda c: c.get("checkpointed_at") or 0)
+        latest = max(blobs.values(), key=lambda c: c.get("checkpointed_at") or 0)
         out.cursor = latest.get("cursor")
         out.sync_id = latest.get("sync_id")
         out.selection_hash = latest.get("selection_hash")
+        out.streams = {
+            name: cls._stream_keys(blob) for name, blob in blobs.items() if blob.get("checkpointed_at") == latest.get("checkpointed_at")
+        }
         return out
 
     def restart(self) -> None:
@@ -475,17 +487,19 @@ class SourceConvexDataSync(AbstractSource):
         client = self._client(config)
         try:
             client.list_active_syncs()
-            schemas = self._table_schemas(config, client)
+            streams = self._streams(config, client)
         except AirbyteTracedException as e:
             return False, e.message
         except ConvexApiError as e:
             return False, str(e)
-        if not schemas:
+        if not streams:
             return False, "No tables found. Check the deployment URL, the deploy key, and the schema source."
         return True, None
 
     def streams(self, config: Mapping[str, Any]) -> List[Stream]:
-        client = self._client(config)
+        return self._streams(config, self._client(config))
+
+    def _streams(self, config: Mapping[str, Any], client: ConvexClient) -> List[ConvexTableStream]:
         try:
             schemas = self._table_schemas(config, client)
         except ConvexApiError as e:
@@ -523,11 +537,11 @@ class SourceConvexDataSync(AbstractSource):
         checkpoint_pages = int(config.get("state_checkpoint_pages") or STATE_CHECKPOINT_PAGES)
 
         # Resolve every configured stream to its (component, table) against what the deployment exposes now.
-        known = {stream.name: (stream.component, stream.table) for stream in self.streams(config)}
+        known = {stream.name: (stream.component, stream.table) for stream in self._streams(config, client)}
         pair_to_name: Dict[Tuple[str, str], str] = {}
         for name, cs in configured.items():
             pair = self._pair_for(cs, known)
-            if pair is None or pair not in known.values():
+            if pair is None:
                 logger.warning(
                     "The stream %r in your connection configuration was not found in the source. Refresh the schema in your "
                     "connection or inline schema to remove it.",
@@ -550,24 +564,33 @@ class SourceConvexDataSync(AbstractSource):
         for cs in selected.values():
             yield stream_status_message(cs.stream, AirbyteStreamStatus.STARTED)
 
-        # Streams that must be re-sent from scratch on a resumed sync: full refresh streams, and streams whose
-        # own state was cleared (the platform's per-stream reset) or that were never synced before. Deselecting
-        # them for one page and reselecting them makes Convex re-sync them from scratch with a leading truncate
-        # (documented ``selection`` semantics).
+        # Streams that must be re-sent from scratch on a resumed sync: full refresh streams (unless a previous
+        # run's re-sync of them is still in progress, in which case Convex just carries on), and streams whose
+        # own state was cleared (the platform's per-stream reset), is stale, or that were never synced before.
+        # Deselecting them for one page and reselecting them makes Convex re-sync them from scratch with a
+        # leading truncate (documented ``selection`` semantics).
+        full_refresh = {name for name, cs in selected.items() if cs.sync_mode == SyncMode.full_refresh}
         priming_selection: Optional[Dict[str, Any]] = None
         if resuming:
-            resnapshot = {name for name, cs in selected.items() if cs.sync_mode == SyncMode.full_refresh or name not in sync_state.streams}
+            resnapshot = {
+                name
+                for name in selected
+                if name not in sync_state.streams
+                or (name in full_refresh and sync_state.streams[name].get("snapshot_complete") is not False)
+            }
             if resnapshot:
                 keep = [pair for pair, name in pair_to_name.items() if name not in resnapshot]
                 priming_selection = build_selection(keep)
                 for name in resnapshot:
                     sync_state.stream(name)["snapshot_complete"] = False
                 logger.info("Asking Convex to re-sync %s from scratch.", sorted(resnapshot))
+        for name in selected:
+            sync_state.stream(name).setdefault("snapshot_complete", False)
 
-        def finish(status: AirbyteStreamStatus) -> Iterator[AirbyteMessage]:
+        def finish(status: AirbyteStreamStatus, incomplete: Set[str] = frozenset()) -> Iterator[AirbyteMessage]:
             yield from sync_state.to_messages(selected.keys())
-            for cs in selected.values():
-                yield stream_status_message(cs.stream, status)
+            for name, cs in selected.items():
+                yield stream_status_message(cs.stream, AirbyteStreamStatus.INCOMPLETE if name in incomplete else status)
 
         running_emitted: Set[str] = set()
         dropped: Dict[Tuple[str, str], int] = {}
@@ -584,7 +607,12 @@ class SourceConvexDataSync(AbstractSource):
                     page = client.data_sync(sync_state.cursor, selection)
                 except ConvexApiError as e:
                     if e.code in RESTART_ERROR_CODES and sync_state.cursor is not None and not restarted:
-                        logger.warning("Convex rejected the saved cursor (%s); restarting the data sync from scratch.", e.code)
+                        logger.warning(
+                            "Convex rejected the saved cursor (%s); restarting the data sync from scratch. Every table will be re-sent "
+                            "in full, but rows deleted since the last sync are not tombstoned, so reset the streams in the destination "
+                            "if you need an exact mirror.",
+                            e.code,
+                        )
                         sync_state.restart()
                         priming_selection = None
                         restarted = True
@@ -617,6 +645,9 @@ class SourceConvexDataSync(AbstractSource):
                     name = pair_to_name.get(pair)
                     if name is None:
                         dropped[pair] = dropped.get(pair, 0) + 1
+                        continue
+                    if name in full_refresh and value.get("deleted"):
+                        # A full refresh mirrors the live documents; a tombstone would land as a row of nulls.
                         continue
                     if name not in running_emitted:
                         running_emitted.add(name)
@@ -651,7 +682,15 @@ class SourceConvexDataSync(AbstractSource):
             yield from finish(AirbyteStreamStatus.INCOMPLETE)
             raise
 
-        yield from finish(AirbyteStreamStatus.COMPLETE)
+        # A full refresh stream is only complete once the sync is up to date; stopping early leaves its snapshot partial.
+        partial = {name for name in full_refresh if not sync_state.stream(name).get("snapshot_complete")}
+        if partial:
+            logger.warning(
+                "Stopped before the full refresh snapshot of %s finished; reporting them incomplete so the destination keeps "
+                "its previous data. Raise max_pages_per_sync or switch them to incremental.",
+                sorted(partial),
+            )
+        yield from finish(AirbyteStreamStatus.COMPLETE, incomplete=partial)
         if dropped:
             logger.warning(
                 "Dropped %d documents from tables not in the configured catalog: %s",
@@ -662,8 +701,15 @@ class SourceConvexDataSync(AbstractSource):
 
     @staticmethod
     def _pair_for(configured_stream: ConfiguredAirbyteStream, known: Mapping[str, Tuple[str, str]]) -> Optional[Tuple[str, str]]:
-        """Recover ``(component, table)`` from a stream: the schema's origin hint, else the discovered stream of that name."""
+        """``(component, table)`` of the discovered stream with this name, or None when the deployment no longer has it.
+
+        The schema's origin hint (written by discover) must agree: if a different table now maps to this stream name,
+        the configured stream is treated as missing rather than silently bound to the new table.
+        """
+        pair = known.get(configured_stream.stream.name)
         schema = configured_stream.stream.json_schema or {}
-        if "x-convex-table" in schema:
-            return schema.get("x-convex-component", ROOT_COMPONENT), schema["x-convex-table"]
-        return known.get(configured_stream.stream.name)
+        if pair is not None and "x-convex-table" in schema:
+            hint = (schema.get("x-convex-component", ROOT_COMPONENT), schema["x-convex-table"])
+            if hint != pair:
+                return None
+        return pair
