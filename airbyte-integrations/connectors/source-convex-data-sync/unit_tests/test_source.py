@@ -138,7 +138,8 @@ def test_validator_to_json_schema_rejects_unknown_kind():
         validator_to_json_schema({"type": "tuple"})
 
 
-def test_validator_to_json_schema_decodes_int64_literals():
+def test_validator_to_json_schema_distinguishes_numeric_literal_types():
+    assert validator_to_json_schema({"type": "literal", "value": 5}) == {"type": "number", "enum": [5]}
     # ``v.literal(5n)`` serialises as base64 little-endian bytes, while the data sync export ships a plain number.
     assert validator_to_json_schema({"type": "literal", "value": {"$integer": "BQAAAAAAAAA="}}) == {"type": "integer", "enum": [5]}
     assert validator_to_json_schema({"type": "literal", "value": {"$integer": "//////////8="}}) == {"type": "integer", "enum": [-1]}
@@ -156,6 +157,8 @@ def test_validator_to_json_schema_decodes_int64_literals():
         {"type": "literal", "value": {"$bytes": "AA=="}},
         {"type": "literal", "value": {"$integer": "not base64"}},
         {"type": "literal", "value": {"$integer": "AA=="}},
+        {"type": "literal", "value": {"$float": "not base64"}},
+        {"type": "literal", "value": {"$float": "AA=="}},
     ],
 )
 def test_validator_to_json_schema_rejects_malformed_nested_validators_as_config_errors(validator):
@@ -187,7 +190,7 @@ def test_check_connection_ok(requests_mock, inline_config):
     ok, error = SourceConvexDataSync().check_connection(logger, inline_config)
     assert ok and error is None
     assert requests_mock.last_request.headers["Authorization"] == "Convex test_api_key"
-    # convex-backend only attributes syncs to Airbyte for the "airbyte-export" client name.
+    # Convex recognises the versioned Airbyte client prefix.
     assert requests_mock.last_request.headers["Convex-Client"].startswith("airbyte-export-")
 
 
@@ -316,3 +319,36 @@ def test_document_union_accepts_overlapping_fields_and_discriminators(nested):
     for document in [{"kind": "text", "x": "hello"}, {"kind": "number", "x": 42}]:
         Draft7Validator(schema).validate(document)
     assert set(schema["properties"]) >= {"kind", "x", "_id", "_ab_cdc_deleted_at"}
+
+
+@pytest.mark.parametrize("number", [-0.0, float("inf"), float("-inf"), float("nan")])
+def test_float_literals_accept_the_lossless_export_encoding(number):
+    import base64
+    import math
+    import struct
+
+    from jsonschema import Draft7Validator
+
+    encoded = base64.b64encode(struct.pack("<d", number)).decode()
+    schema = validator_to_json_schema({"type": "literal", "value": {"$float": encoded}})
+    Draft7Validator.check_schema(schema)
+    exported = number if math.isfinite(number) else {"$float": encoded}
+    Draft7Validator(schema).validate(exported)
+
+
+def test_check_rejects_empty_table_list_before_contacting_convex(requests_mock, inline_config):
+    inline_config["schema_json"] = "{}"
+    requests_mock.get(ACTIVE_SYNCS_URL, status_code=401)
+    result = SourceConvexDataSync().check(logger, inline_config)
+    assert result.status == Status.FAILED
+    assert result.message == "The schema JSON lists no tables."
+    assert not requests_mock.called
+
+
+def test_number_schema_requires_the_encoded_float_field():
+    from jsonschema import Draft7Validator
+
+    validator = Draft7Validator(validator_to_json_schema({"type": "number"}))
+    assert validator.is_valid(1.5)
+    assert validator.is_valid({"$float": "AAAAAAAA8H8="})
+    assert not validator.is_valid({"unrelated": "value"})

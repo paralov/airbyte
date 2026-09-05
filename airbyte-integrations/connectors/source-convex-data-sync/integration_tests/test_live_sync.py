@@ -14,10 +14,12 @@ from source_convex_data_sync.source import SourceConvexDataSync
 from airbyte_cdk.models import ConfiguredAirbyteCatalog, ConfiguredAirbyteStream, DestinationSyncMode, Status, SyncMode, Type
 
 
-def test_live_snapshot_and_resume():
-    config_path = Path(os.environ.get("CONVEX_TEST_CONFIG", "secrets/config.json"))
-    if not config_path.is_file():
-        pytest.skip("Set CONVEX_TEST_CONFIG to a disposable Convex Pro deployment's config.json")
+@pytest.mark.parametrize("sync_mode", [SyncMode.incremental, SyncMode.full_refresh])
+def test_live_snapshot_and_resume(sync_mode):
+    configured_path = os.environ.get("CONVEX_TEST_CONFIG")
+    config_path = Path(configured_path or "secrets/config.json")
+    if configured_path is None and not config_path.is_file():
+        pytest.skip("Set CONVEX_TEST_CONFIG to a disposable Convex deployment's config.json")
     config = json.loads(config_path.read_text())
     config["max_pages_per_sync"] = 0
     source = SourceConvexDataSync()
@@ -31,8 +33,10 @@ def test_live_snapshot_and_resume():
         streams=[
             ConfiguredAirbyteStream(
                 stream=stream,
-                sync_mode=SyncMode.incremental,
-                destination_sync_mode=DestinationSyncMode.append_dedup,
+                sync_mode=sync_mode,
+                destination_sync_mode=DestinationSyncMode.overwrite
+                if sync_mode == SyncMode.full_refresh
+                else DestinationSyncMode.append_dedup,
                 cursor_field=["_ts"],
                 primary_key=[["_id"]],
             )
@@ -57,7 +61,7 @@ def test_live_snapshot_and_resume():
             elif message.type == Type.STATE:
                 descriptor = message.state.stream.stream_descriptor
                 checkpoints[(descriptor.namespace, descriptor.name)] = message.state
-        if initial:
+        if initial or sync_mode == SyncMode.full_refresh:
             assert seen == set(schemas), "Every selected table must contain at least one fixture document"
         assert set(checkpoints) == set(schemas)
         blobs = [vars(checkpoint.stream.stream_state) for checkpoint in checkpoints.values()]

@@ -30,8 +30,12 @@ import json
 import logging
 import math
 import re
+import sqlite3
+import struct
 import time
+from contextlib import ExitStack, closing
 from datetime import datetime, timezone
+from tempfile import TemporaryDirectory
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Set, Tuple
 from urllib.parse import urlsplit
 
@@ -62,8 +66,8 @@ from airbyte_cdk.utils.traced_exception import AirbyteTracedException, FailureTy
 LOGGER = logging.getLogger("airbyte")
 
 CONVEX_CLIENT_VERSION = "0.1.0"
-# convex-backend attributes a sync to Airbyte (and prefixes its sync id with ``airbyte-``) only for the
-# ``airbyte-export`` client name; any other name is classified as an unrecognised client.
+# Convex recognises the versioned ``airbyte-export-`` client prefix and gives
+# these syncs an ``airbyte-`` sync ID.
 CONVEX_CLIENT_HEADER = f"airbyte-export-{CONVEX_CLIENT_VERSION}"
 
 ROOT_COMPONENT = ""
@@ -258,22 +262,24 @@ TableSchemas = Dict[Tuple[str, str], Optional[Dict[str, Any]]]  # (component, ta
 # plain JSON numbers, while bytes and non-finite floats are wrapped as ``{"$bytes": ...}`` / ``{"$float": ...}``.
 INT64_SCHEMA: Dict[str, Any] = {"type": "integer"}
 BYTES_SCHEMA: Dict[str, Any] = {"type": "object", "properties": {"$bytes": {"type": "string"}}, "required": ["$bytes"]}
-FLOAT_SCHEMA: Dict[str, Any] = {"anyOf": [{"type": "number"}, {"type": "object", "properties": {"$float": {"type": "string"}}}]}
+FLOAT_SCHEMA: Dict[str, Any] = {
+    "anyOf": [{"type": "number"}, {"type": "object", "properties": {"$float": {"type": "string"}}, "required": ["$float"]}]
+}
 
 
 def _invalid_validator(detail: str) -> AirbyteTracedException:
     return AirbyteTracedException(message=f"Invalid Convex validator in the schema JSON: {detail}.", failure_type=FailureType.config_error)
 
 
-def _int64_literal(encoded: str) -> int:
-    """``v.literal(5n)`` serialises its value as ``{"$integer": <base64 little-endian int64>}``."""
+def _literal_bytes(encoded: str, tag: str) -> bytes:
+    """Numeric validator literals use base64 little-endian eight-byte values."""
     try:
         raw = base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError) as e:
-        raise _invalid_validator(f"literal {{'$integer': {encoded!r}}} is not base64") from e
+        raise _invalid_validator(f"literal {{{tag!r}: {encoded!r}}} is not base64") from e
     if len(raw) != 8:
-        raise _invalid_validator(f"literal {{'$integer': {encoded!r}}} is not an int64")
-    return int.from_bytes(raw, "little", signed=True)
+        raise _invalid_validator(f"literal {{{tag!r}: {encoded!r}}} must contain eight bytes")
+    return raw
 
 
 def validator_to_json_schema(validator: Mapping[str, Any]) -> Dict[str, Any]:
@@ -308,7 +314,15 @@ def validator_to_json_schema(validator: Mapping[str, Any]) -> Dict[str, Any]:
         value = validator.get("value")
         if isinstance(value, Mapping) and isinstance(value.get("$integer"), str):
             # The data sync export ships int64 values as plain JSON numbers, so the enum holds the decoded integer.
-            return {"type": "integer", "enum": [_int64_literal(value["$integer"])]}
+            return {"type": "integer", "enum": [int.from_bytes(_literal_bytes(value["$integer"], "$integer"), "little", signed=True)]}
+        if isinstance(value, Mapping) and isinstance(value.get("$float"), str):
+            (number,) = struct.unpack("<d", _literal_bytes(value["$float"], "$float"))
+            if math.isfinite(number):
+                # Validator JSON wraps -0, but export JSON sends it as -0.0.
+                return {"type": "number", "enum": [number]}
+            # NaNs can have different payload bits; do not require a particular encoding.
+            return {"type": "object", "properties": {"$float": {"type": "string"}}, "required": ["$float"]}
+        # Untagged numeric literals are Convex float64 values, including JSON integers.
         json_type = {bool: "boolean", int: "number", float: "number", str: "string"}.get(type(value))
         if json_type is None:
             raise _invalid_validator(f"unsupported literal value {value!r}")
@@ -487,7 +501,6 @@ class SyncState:
         self.checkpoint_seq = 0
         self.replay_from: Optional[Dict[str, Any]] = None
         self.up_to_date = False
-        self.rewinding = False
         self.streams: Dict[StreamKey, Dict[str, Any]] = {}
 
     @classmethod
@@ -517,7 +530,6 @@ class SyncState:
             candidates = [blob.get("replay_from") or blob for blob in blobs.values()] if diverged else list(blobs.values())
             oldest = min(candidates, key=lambda c: int(c.get("checkpointed_at") or 0))
             if diverged:
-                out.rewinding = True
                 out.replay_from = {key: oldest.get(key) for key in cls.SHARED_KEYS if key != "replay_from"}
             elif not all(blob.get("up_to_date") for blob in blobs.values()):
                 # Agreement on a capped recovery page does not establish that it
@@ -541,9 +553,6 @@ class SyncState:
 
     def stream(self, key: StreamKey) -> Dict[str, Any]:
         return self.streams.setdefault(key, {})
-
-    def snapshot_complete(self, key: StreamKey) -> bool:
-        return self.streams.get(key, {}).get("snapshot_complete") is True
 
     def to_messages(self, keys: Iterable[StreamKey]) -> Iterator[AirbyteMessage]:
         self.checkpoint_seq += 1
@@ -598,7 +607,8 @@ def _record_from_value(value: Mapping[str, Any]) -> Dict[str, Any]:
     ts_ns = int(value["ts"])
     deleted = bool(value.get("deleted", False))
     # Naive UTC ISO string, matching the format used by the original Convex source connector.
-    ts_iso = datetime.fromtimestamp(ts_ns / 1e9, tz=timezone.utc).replace(tzinfo=None).isoformat()
+    seconds, nanoseconds = divmod(ts_ns, 1_000_000_000)
+    ts_iso = datetime.fromtimestamp(seconds, tz=timezone.utc).replace(microsecond=nanoseconds // 1000, tzinfo=None).isoformat()
     record["_ts"] = ts_ns
     record["_deleted"] = deleted
     record["_component"] = value["component"]
@@ -621,6 +631,33 @@ def _next_cursor(page: Mapping[str, Any]) -> str:
             failure_type=FailureType.system_error,
         )
     return next_cursor
+
+
+class FullRefreshSnapshot:
+    """Keep the latest live revision on disk until Convex reaches a consistent snapshot."""
+
+    def __init__(self, connection: sqlite3.Connection):
+        self.connection = connection
+        connection.execute(
+            "CREATE TABLE documents (component TEXT, table_name TEXT, id TEXT, record TEXT, "
+            "PRIMARY KEY (component, table_name, id)) WITHOUT ROWID"
+        )
+
+    def truncate(self, key: StreamKey) -> None:
+        self.connection.execute("DELETE FROM documents WHERE component = ? AND table_name = ?", key)
+
+    def apply(self, key: StreamKey, value: Mapping[str, Any]) -> None:
+        if value.get("deleted"):
+            self.connection.execute(
+                "DELETE FROM documents WHERE component = ? AND table_name = ? AND id = ?", (*key, value["value"]["_id"])
+            )
+        else:
+            record = _record_from_value(value)
+            self.connection.execute("INSERT OR REPLACE INTO documents VALUES (?, ?, ?, ?)", (*key, record["_id"], json.dumps(record)))
+
+    def records(self, key: StreamKey) -> Iterator[Dict[str, Any]]:
+        for (record,) in self.connection.execute("SELECT record FROM documents WHERE component = ? AND table_name = ?", key):
+            yield json.loads(record)
 
 
 class SourceConvexDataSync(AbstractSource):
@@ -650,14 +687,13 @@ class SourceConvexDataSync(AbstractSource):
     def check_connection(self, logger: logging.Logger, config: Mapping[str, Any]) -> Tuple[bool, Any]:
         client = self._client(config, max_attempts=CHECK_MAX_ATTEMPTS)
         try:
-            streams = self._streams(config)
+            if not self._streams(config):
+                return False, "The schema JSON lists no tables."
             client.list_active_syncs()
         except AirbyteTracedException as e:
             return False, e.message
         except ConvexApiError as e:
             return False, str(e)
-        if not streams:
-            return False, "The schema JSON lists no tables."
         return True, None
 
     def streams(self, config: Mapping[str, Any]) -> List[Stream]:
@@ -720,30 +756,25 @@ class SourceConvexDataSync(AbstractSource):
         for cs in selected.values():
             yield stream_status_message(cs.stream, AirbyteStreamStatus.STARTED)
 
-        # Streams that must be re-sent from scratch on a resumed sync: full refresh streams (unless a previous
-        # attempt's re-sync of them is still in progress, in which case Convex just carries on), and streams whose
-        # own state was cleared (the platform's per-stream reset), or that were never synced before.
-        # Deselecting them for one page and reselecting them makes Convex re-sync them from scratch with a
-        # leading truncate (documented ``selection`` semantics).
+        # Full refresh is rebuilt on every attempt because its buffered rows are
+        # local to this process. Clearing a stream's state also requests a snapshot.
+        # Deselecting and reselecting makes Convex start a fresh table traversal.
         full_refresh = {name for name, cs in selected.items() if cs.sync_mode == SyncMode.full_refresh}
         priming_selection: Optional[Dict[str, Any]] = None
         resnapshot: Set[StreamKey] = set()
         if resuming:
-            resnapshot = {
-                name
-                for name in selected
-                # A full refresh stream whose flag is missing (older state) is re-snapshotted: that is the safe default.
-                if name not in sync_state.streams
-                or (name in full_refresh and (sync_state.rewinding or sync_state.streams[name].get("snapshot_complete") is not False))
-            }
+            resnapshot = {name for name in selected if name not in sync_state.streams or name in full_refresh}
             if resnapshot:
                 priming_selection = build_selection(key for key in selected if key not in resnapshot)
                 for name in resnapshot:
                     sync_state.stream(name)["snapshot_complete"] = False
                     sync_state.stream(name)["awaiting_truncate"] = True
+                    sync_state.stream(name)["has_records"] = False
                 logger.info("Asking Convex to re-sync %s from scratch.", [_describe(key) for key in sorted(resnapshot)])
         for name in selected:
             sync_state.stream(name).setdefault("snapshot_complete", False)
+            # Older states do not tell us whether destination rows exist.
+            sync_state.stream(name).setdefault("has_records", resuming and name not in resnapshot)
 
         # A table's first truncate proves it exists, even if its snapshot spans runs.
         for name in selected:
@@ -762,8 +793,11 @@ class SourceConvexDataSync(AbstractSource):
             )
             max_pages = 0
 
+        full_refresh_emitted = False
+
         def checkpoint() -> Iterator[AirbyteMessage]:
-            return sync_state.to_messages(selected)
+            # A local buffer is not durable Airbyte output. A retry must rebuild it.
+            return sync_state.to_messages(key for key in selected if key not in full_refresh or full_refresh_emitted)
 
         def finish(status: AirbyteStreamStatus, checkpoint_state: bool = True) -> Iterator[AirbyteMessage]:
             if checkpoint_state:
@@ -777,103 +811,121 @@ class SourceConvexDataSync(AbstractSource):
         records = 0
         status_type: Optional[str] = None
 
+        def emit_record(name: StreamKey, record: Dict[str, Any]) -> Iterator[AirbyteMessage]:
+            nonlocal records
+            if name not in running_emitted:
+                running_emitted.add(name)
+                yield stream_status_message(selected[name].stream, AirbyteStreamStatus.RUNNING)
+            records += 1
+            sync_state.stream(name)["has_records"] = True
+            yield AirbyteMessage(
+                type=Type.RECORD,
+                record=AirbyteRecordMessage(
+                    stream=name[1], namespace=namespace_for(name[0]), data=record, emitted_at=int(time.time() * 1000)
+                ),
+            )
+
         try:
-            while True:
-                priming = priming_selection is not None
-                selection = priming_selection if priming else full_selection
-                try:
-                    page = client.data_sync(sync_state.cursor, selection)
-                except ConvexApiError as e:
-                    if e.code in UNUSABLE_CURSOR_ERROR_CODES and sync_state.cursor is not None:
-                        reason = (
-                            "The saved Convex cursor expired. A fresh snapshot cannot recover deletes from the expired history."
-                            if e.code == "DataSyncCursorExpired"
-                            else "Convex rejected the saved cursor. The deployment URL may have changed since the last sync."
+            with ExitStack() as resources:
+                snapshot = None
+                if full_refresh:
+                    directory = resources.enter_context(TemporaryDirectory(prefix="convex-full-refresh-"))
+                    connection = resources.enter_context(closing(sqlite3.connect(f"{directory}/snapshot.sqlite")))
+                    snapshot = FullRefreshSnapshot(connection)
+                while True:
+                    priming = priming_selection is not None
+                    selection = priming_selection if priming else full_selection
+                    try:
+                        page = client.data_sync(sync_state.cursor, selection)
+                    except ConvexApiError as e:
+                        if e.code in UNUSABLE_CURSOR_ERROR_CODES and sync_state.cursor is not None:
+                            reason = (
+                                "The saved Convex cursor expired. A fresh snapshot cannot recover deletes from the expired history."
+                                if e.code == "DataSyncCursorExpired"
+                                else "Convex rejected the saved cursor. The deployment URL may have changed since the last sync."
+                            )
+                            raise AirbyteTracedException(
+                                message=f"{reason} Clear the connection's data and sync again.",
+                                internal_message=str(e),
+                                failure_type=FailureType.config_error,
+                            ) from e
+                        raise e.as_traced() from e
+                    next_cursor = _next_cursor(page)
+                    priming_selection = None
+
+                    sync_state.sync_id = page.get("syncId", sync_state.sync_id)
+
+                    truncates = {
+                        (truncate.get("component", ROOT_COMPONENT), truncate["table"]) for truncate in page.get("truncates", [])
+                    } & selected.keys()
+                    for name in truncates - full_refresh:
+                        if sync_state.stream(name).get("has_records"):
+                            raise AirbyteTracedException(
+                                message=(
+                                    f"Convex restarted table {_describe(name)} after records were emitted. A new snapshot cannot "
+                                    "remove previously replicated rows. Clear this stream's data in Airbyte and sync again."
+                                ),
+                                failure_type=FailureType.config_error,
+                            )
+                    for name in truncates:
+                        if snapshot is not None and name in full_refresh:
+                            snapshot.truncate(name)
+                        sync_state.stream(name)["awaiting_truncate"] = False
+                        sync_state.stream(name)["snapshot_complete"] = False
+
+                    for value in page.get("values", []):
+                        name = (value.get("component", ROOT_COMPONENT), value["table"])
+                        if name not in selected:
+                            dropped[name] = dropped.get(name, 0) + 1
+                            continue
+                        if snapshot is not None and name in full_refresh:
+                            snapshot.apply(name, value)
+                        else:
+                            yield from emit_record(name, _record_from_value(value))
+
+                    sync_state.cursor = next_cursor
+                    pages += 1
+                    status_type = page.get("status", {}).get("type")
+                    up_to_date = status_type == UP_TO_DATE_STATUS
+                    sync_state.up_to_date = up_to_date and not priming
+                    # The priming page describes a sync that still excludes the re-snapshot streams, so it never
+                    # counts as complete for them.
+                    if up_to_date and not priming:
+                        missing = {name for name in selected if sync_state.stream(name).get("awaiting_truncate")}
+                        if missing:
+                            logger.warning(
+                                "Convex never started syncing %s: these tables do not exist in the deployment (check the Table Schemas "
+                                "field for typos). They are reported incomplete; the other streams are complete.",
+                                [_describe(key) for key in sorted(missing)],
+                            )
+                        for name in selected:
+                            if name not in missing:
+                                sync_state.stream(name)["snapshot_complete"] = True
+
+                    if pages % checkpoint_pages == 0:
+                        yield from checkpoint()
+
+                    if priming:
+                        continue  # Always fetch at least one page with the full selection so the deselected tables come back.
+                    # An upToDate page is a consistent snapshot through its snapshotTs. `hasMore` is always true on a
+                    # live sync and a busy deployment can keep upToDate pages non-empty forever, so stop here.
+                    if up_to_date:
+                        break
+                    if max_pages and pages >= max_pages:
+                        logger.info(
+                            "Reached max_pages_per_sync=%d; checkpointing and stopping. The next sync resumes from the saved cursor.",
+                            max_pages,
                         )
-                        raise AirbyteTracedException(
-                            message=f"{reason} Clear the connection's data and sync again.",
-                            internal_message=str(e),
-                            failure_type=FailureType.config_error,
-                        ) from e
-                    raise e.as_traced() from e
-                next_cursor = _next_cursor(page)
-                priming_selection = None
-                pages += 1
+                        break
 
-                sync_state.sync_id = page.get("syncId", sync_state.sync_id)
-
-                for truncate in page.get("truncates", []):
-                    name = (truncate.get("component", ROOT_COMPONENT), truncate["table"])
-                    if name not in selected:
-                        continue
-                    sync_state.stream(name)["awaiting_truncate"] = False
-                    if sync_state.snapshot_complete(name):
-                        # Truncates during the initial snapshot are normal; after it they mean the table was replaced.
-                        logger.warning(
-                            "Convex truncated table %s (component %r); it will be re-sent in full. Rows deleted before the truncate "
-                            "are not tombstoned, so reset this stream in the destination if you need an exact mirror.",
-                            truncate["table"],
-                            name[0],
-                        )
-                    sync_state.stream(name)["snapshot_complete"] = False
-
-                for value in page.get("values", []):
-                    name = (value.get("component", ROOT_COMPONENT), value["table"])
-                    if name not in selected:
-                        dropped[name] = dropped.get(name, 0) + 1
-                        continue
-                    if name in full_refresh and value.get("deleted"):
-                        # A full refresh mirrors the live documents; a tombstone would land as a row of nulls.
-                        continue
-                    if name not in running_emitted:
-                        running_emitted.add(name)
-                        yield stream_status_message(selected[name].stream, AirbyteStreamStatus.RUNNING)
-                    records += 1
-                    yield AirbyteMessage(
-                        type=Type.RECORD,
-                        record=AirbyteRecordMessage(
-                            stream=name[1],
-                            namespace=namespace_for(name[0]),
-                            data=_record_from_value(value),
-                            emitted_at=int(time.time() * 1000),
-                        ),
-                    )
-
-                sync_state.cursor = next_cursor
-                status_type = page.get("status", {}).get("type")
-                up_to_date = status_type == UP_TO_DATE_STATUS
-                sync_state.up_to_date = up_to_date and not priming
-                # The priming page describes a sync that still excludes the re-snapshot streams, so it never
-                # counts as complete for them.
-                if up_to_date and not priming:
-                    missing = {name for name in selected if sync_state.stream(name).get("awaiting_truncate")}
-                    if missing:
-                        logger.warning(
-                            "Convex never started syncing %s: these tables do not exist in the deployment (check the Table Schemas "
-                            "field for typos). They are reported incomplete; the other streams are complete.",
-                            [_describe(key) for key in sorted(missing)],
-                        )
-                    for name in selected:
-                        if name not in missing:
-                            sync_state.stream(name)["snapshot_complete"] = True
-
-                if pages % checkpoint_pages == 0:
-                    yield from checkpoint()
-
-                if priming:
-                    continue  # Always fetch at least one page with the full selection so the deselected tables come back.
-                # An upToDate page is a consistent snapshot through its snapshotTs. `hasMore` is always true on a
-                # live sync and a busy deployment can keep upToDate pages non-empty forever, so stop here.
-                if up_to_date:
-                    break
-                if max_pages and pages >= max_pages:
-                    logger.info(
-                        "Reached max_pages_per_sync=%d; checkpointing and stopping. The next sync resumes from the saved cursor.", max_pages
-                    )
-                    break
+                if snapshot is not None:
+                    for name in sorted(full_refresh - missing):
+                        for record in snapshot.records(name):
+                            yield from emit_record(name, record)
+                full_refresh_emitted = True
         except Exception:
-            # With no page fetched the cursor has not moved: leave the previous checkpoint alone rather than persist the
-            # snapshot_complete=False flags set above, which would make the next attempt skip the re-snapshot.
+            # With no completed page, preserve the original state so a failed
+            # priming page cannot cancel a cleared stream's pending snapshot.
             yield from finish(AirbyteStreamStatus.INCOMPLETE, checkpoint_state=pages > 0)
             raise
 

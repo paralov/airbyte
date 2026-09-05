@@ -38,7 +38,8 @@ connectionSpecification:
       title: Max Pages Per Sync
       description: >-
         Stop after this many data sync pages and checkpoint; the next sync resumes from the saved cursor.
-        0 means run until the sync is up to date.
+        0 means run until the sync is up to date. Ignored when Full Refresh streams are selected,
+        because their buffered snapshot must finish before records can be emitted.
       default: 0
       minimum: 0
       order: 3

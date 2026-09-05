@@ -29,7 +29,7 @@ configured catalog for your deployment before running a read.
 
 ## Live integration test
 
-Use a disposable Convex Pro deployment with at least one seeded root table and
+Use a disposable Convex deployment (Pro on Convex Cloud) with a seeded root table and
 one seeded component table. Select only those fixtures in the config's table
 schemas. The test reads those tables, validates their records, and resumes from
 the returned state. It does not mutate the deployment.
@@ -47,9 +47,9 @@ live Convex behavior or destination deduplication.
 From this directory, with Docker running and `yq` installed:
 
 ```sh
-docker build -f ../../../docker-images/Dockerfile.python-connector \
+docker build --platform linux/amd64 -f ../../../docker-images/Dockerfile.python-connector \
   --build-arg CONNECTOR_NAME=source-convex-data-sync \
   --build-arg BASE_IMAGE="$(yq -r '.data.connectorBuildOptions.baseImage' metadata.yaml)" \
   -t airbyte/source-convex-data-sync:dev .
-docker run --rm airbyte/source-convex-data-sync:dev spec
+docker run --rm --platform linux/amd64 airbyte/source-convex-data-sync:dev spec
 ```

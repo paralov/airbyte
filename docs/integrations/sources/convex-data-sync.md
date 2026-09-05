@@ -33,7 +33,8 @@ Every record includes the fields defined for the table plus these system fields:
 
 1. `_id` uniquely identifies the document. It is not changed by `.patch` or `.replace` operations.
 2. `_creationTime` records a timestamp in milliseconds when the document was initially created.
-3. `_ts` records the database timestamp in nanoseconds when this revision was written. It is the cursor.
+3. `_ts` is the revision timestamp in nanoseconds and the Airbyte cursor field. Resumption uses a
+   separate opaque Convex cursor saved in state.
 4. `_deleted` is `true` for tombstones. Deleted documents only carry `_id` and the system fields.
 5. `_component` and `_table` record where the document came from.
 6. `_ab_cdc_lsn`, `_ab_cdc_updated_at`, and `_ab_cdc_deleted_at` follow the CDC convention used by
@@ -82,15 +83,15 @@ all selected streams acknowledge the same up-to-date cursor, so repeated partial
   Convex rejects the cursor (for example after changing the deployment URL), the sync fails with a
   configuration error instead of piling a fresh snapshot onto the old rows. Clear the connection's data
   and sync again.
-- A Full Refresh stream is only complete once the sync is up to date, and Airbyte clears Full Refresh
-  state between jobs, so its snapshot has to finish within one run: "Max Pages Per Sync" is not applied
-  while Full Refresh streams are selected. If a run fails midway, the retry attempt continues the
-  snapshot. Tombstones are never emitted into Full Refresh streams, so a document deleted while its
-  snapshot was still in progress can survive in the destination until the next run; use Incremental
-  Dedupe for an exact mirror.
-- If Convex truncates a table (for example after `npx convex import --replace`), the connector logs
-  a warning and the table is re-sent in full. Rows deleted by the truncate are not tombstoned, so
-  reset that stream in the destination if you need an exact mirror.
+- Full Refresh buffers rows in a temporary SQLite database, applying updates, deletes, and table
+  replacements until Convex reports the sync is up to date. It then emits each live document once.
+  Allow temporary disk space for the selected Full Refresh tables. "Max Pages Per Sync" does not
+  apply to these runs: the snapshot must finish before output can be committed. A failed attempt
+  discards its buffer and starts a new Full Refresh snapshot on retry. Incremental streams in the
+  same connection continue emitting records and checkpoints while the snapshot is buffered.
+- If Convex restarts an Incremental table's traversal after it has emitted rows (for example after
+  `npx convex import --replace`), the sync fails before advancing past that page. A new snapshot
+  cannot remove previously replicated rows. Clear that stream's data in Airbyte and sync again.
 - A sync stops at the first page on which Convex reports the export is up to date; the Incremental
   streams then hold a consistent snapshot of every selected table. Set "Max Pages Per Sync" to bound
   very large initial syncs, and deployments written faster than the connector reads them (Convex may
@@ -116,8 +117,8 @@ all selected streams acknowledge the same up-to-date cursor, so repeated partial
 
 ### Performance considerations
 
-The initial sync walks every selected table once, then streams changes. Pages are small, so a large
-deployment takes many requests; the connector checkpoints state every 25 pages by default ("State
+The initial sync walks every selected table once, then streams changes. Large deployments can require
+many requests; the connector checkpoints state every 25 pages by default ("State
 Checkpoint Interval"). Each request waits up to "Request Timeout" seconds and is retried with backoff
 on transient errors.
 
@@ -145,6 +146,6 @@ On the [Convex dashboard](https://dashboard.convex.dev/), navigate to the projec
 
 | Version | Date       | Pull Request                                             | Subject                                                          |
 | :------ | :--------- | :------------------------------------------------------- | :--------------------------------------------------------------- |
-| 0.1.0 | 2026-09-04 | [1](https://github.com/paralov/airbyte/pull/1) | New connector on the Convex Deployment API data sync endpoint: one resumable cursor, component tables as namespaced streams, schemas supplied as Convex validator JSON |
+| 0.1.0 | 2026-09-04 | — | New connector on the Convex Deployment API data sync endpoint: one resumable cursor, component tables as namespaced streams, schemas supplied as Convex validator JSON |
 
 </details>
