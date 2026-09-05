@@ -8,6 +8,7 @@ import logging
 import pytest
 from source_convex_data_sync.source import (
     SourceConvexDataSync,
+    airbyte_schema_for,
     build_selection,
     parse_schema_json,
     validator_to_json_schema,
@@ -68,6 +69,8 @@ def test_parse_schema_json_rejects_bad_input(bad):
     "schema, needle",
     [
         ({"": {"user-profiles": None}}, "'user-profiles' is not a valid Convex table name"),
+        ({"": {"posts\n": None}}, "is not a valid Convex table name"),
+        ({"component\n": {"posts": None}}, "is not a valid Convex component path"),
         ({"": {"_private": None}}, "'_private' is not a valid Convex table name"),
         ({"": {"x" * 65: None}}, "is not a valid Convex table name"),
         ({"better-auth": {"user": None}}, "'better-auth' is not a valid Convex component path"),
@@ -293,3 +296,23 @@ def test_discover_catalog(inline_config):
     assert stream.supported_sync_modes == [SyncMode.full_refresh, SyncMode.incremental]
     assert stream.default_cursor_field == ["_ts"]
     assert stream.source_defined_primary_key == [["_id"]]
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_document_union_accepts_overlapping_fields_and_discriminators(nested):
+    from jsonschema import Draft7Validator
+
+    validator = {
+        "type": "union",
+        "value": [
+            obj({"kind": ({"type": "literal", "value": "text"}, False), "x": ({"type": "string"}, False)}),
+            obj({"kind": ({"type": "literal", "value": "number"}, False), "x": ({"type": "number"}, False)}),
+        ],
+    }
+    if nested:
+        validator = {"type": "union", "value": [validator, obj({"other": ({"type": "boolean"}, False)})]}
+    schema = airbyte_schema_for(validator)
+    Draft7Validator.check_schema(schema)
+    for document in [{"kind": "text", "x": "hello"}, {"kind": "number", "x": 42}]:
+        Draft7Validator(schema).validate(document)
+    assert set(schema["properties"]) >= {"kind", "x", "_id", "_ab_cdc_deleted_at"}

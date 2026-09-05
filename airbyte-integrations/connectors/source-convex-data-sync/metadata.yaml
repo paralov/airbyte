@@ -28,7 +28,7 @@ data:
   supportLevel: community
   connectorTestSuitesOptions:
     - suite: unitTests
-    - suite: acceptanceTests
+    - suite: integrationTests
       testSecrets:
         - name: SECRET_SOURCE-CONVEX-DATA-SYNC__CREDS
           fileName: config.json

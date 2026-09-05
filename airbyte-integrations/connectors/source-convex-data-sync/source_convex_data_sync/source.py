@@ -77,11 +77,9 @@ CONVEX_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 # ``pagination.hasMore`` is documented as always true, so ``upToDate`` is the only completion signal.
 UP_TO_DATE_STATUS = "upToDate"
 
-# The sync went unused for more than 3 days: Convex forgot it, so restart from scratch.
-RESTART_ERROR_CODES = {"DataSyncCursorExpired"}
-# The saved cursor does not belong to this deployment (for example deployment_url was
-# changed). Restarting would layer a fresh snapshot on top of the old rows, so refuse.
-FOREIGN_CURSOR_ERROR_CODES = {"InvalidDataSyncCursor"}
+# Neither an expired cursor nor a cursor from another deployment can safely resume
+# incremental deletes. A fresh snapshot would leave deleted rows in the destination.
+UNUSABLE_CURSOR_ERROR_CODES = {"DataSyncCursorExpired", "InvalidDataSyncCursor"}
 
 # Responses that mean the request itself is wrong (bad URL, key, plan or selection) rather than transient.
 CONFIG_ERROR_STATUS_CODES = {400, 401, 403, 404}
@@ -345,7 +343,7 @@ def validator_to_json_schema(validator: Mapping[str, Any]) -> Dict[str, Any]:
 def _check_table_identifiers(component: str, table: str) -> None:
     """Reject names Convex would refuse in a ``selection`` (HTTP 400 InvalidDataSyncSelection) before the first sync."""
     for segment in component.split("/") if component else []:
-        if not CONVEX_IDENTIFIER.match(segment):
+        if not CONVEX_IDENTIFIER.fullmatch(segment):
             raise AirbyteTracedException(
                 message=f'Schema entry {component!r} is not a valid Convex component path (use "" for the root component).',
                 failure_type=FailureType.config_error,
@@ -356,7 +354,7 @@ def _check_table_identifiers(component: str, table: str) -> None:
                 message=f"Schema entry {component!r}: {SELECTION_OTHER!r} is reserved in Convex selections and cannot name a component.",
                 failure_type=FailureType.config_error,
             )
-    if not CONVEX_IDENTIFIER.match(table) or table.startswith("_"):
+    if not CONVEX_IDENTIFIER.fullmatch(table) or table.startswith("_"):
         raise AirbyteTracedException(
             message=f"{component or '<root>'}/{table!r} is not a valid Convex table name.",
             failure_type=FailureType.config_error,
@@ -406,15 +404,18 @@ def airbyte_schema_for(validator: Optional[Mapping[str, Any]]) -> Dict[str, Any]
     """Stream schema for a table: its validator as JSON Schema (or nothing, for schema-less tables) plus system + CDC fields."""
     schema: Dict[str, Any] = {"$schema": "http://json-schema.org/draft-07/schema#", "type": "object"}
     table_schema = validator_to_json_schema(validator) if validator is not None else {}
-    branches = table_schema.get("anyOf")
-    if isinstance(branches, list):
-        # Union document types: merge every branch's properties into one permissive schema.
-        properties: Dict[str, Any] = {}
-        for branch in branches:
-            if isinstance(branch, dict):
-                properties.update(branch.get("properties", {}))
-    else:
-        properties = dict(table_schema.get("properties", {}))
+    # Airbyte destinations read top-level properties; expose every document-union
+    # branch there, including branches nested inside other unions.
+    properties: Dict[str, Any] = {}
+    branches = [table_schema]
+    while branches:
+        branch = branches.pop()
+        branches.extend(branch.get("anyOf", []))
+        for name, field_schema in branch.get("properties", {}).items():
+            if name in properties and properties[name] != field_schema:
+                properties[name] = {"anyOf": [properties[name], field_schema]}
+            else:
+                properties[name] = field_schema
     properties.update(SYSTEM_FIELD_SCHEMAS)
     schema["properties"] = properties
     schema["additionalProperties"] = True
@@ -467,27 +468,26 @@ class SyncState:
     per-stream state messages (``message_utils.get_stream_descriptor`` rejects
     GLOBAL state), so the same cursor is written into every stream's state at each
     checkpoint along with a ``checkpointed_at`` stamp. The stamp is a monotonic
-    sequence number (continued from the highest stamp in the incoming state, so
-    it never depends on worker clocks): on resume the most recently checkpointed
-    cursor wins, and only streams that took part in that checkpoint keep their
-    per-stream bookkeeping. A stream whose state is older (it was deselected for
-    a while, or its checkpoint was not persisted) is re-synced from scratch, just
-    like one whose state was cleared. That re-sync re-sends the whole table
-    (duplicate rows on an append destination): the price of the platform
-    persisting one stream's checkpoint behind the others' after a failed attempt,
-    which a single GLOBAL state message would avoid if the entrypoint accepted one.
+    sequence number continued from the highest incoming stamp. Resume from the
+    oldest saved checkpoint so changes not acknowledged by every stream, including
+    deletes, are replayed. During recovery, checkpoints also retain that rewind
+    point until all streams agree on an up-to-date cursor: a later checkpoint can still be
+    behind an earlier attempt's cursor. Already acknowledged records may repeat.
 
     The deployment URL is stored alongside the cursor so a cursor is never sent to a
     different deployment than the one that minted it.
     """
 
-    SHARED_KEYS = ("cursor", "sync_id", "deployment_url", "checkpointed_at")
+    SHARED_KEYS = ("cursor", "sync_id", "deployment_url", "checkpointed_at", "replay_from", "up_to_date")
 
     def __init__(self) -> None:
         self.cursor: Optional[str] = None
         self.sync_id: Optional[str] = None
         self.deployment_url: Optional[str] = None
         self.checkpoint_seq = 0
+        self.replay_from: Optional[Dict[str, Any]] = None
+        self.up_to_date = False
+        self.rewinding = False
         self.streams: Dict[StreamKey, Dict[str, Any]] = {}
 
     @classmethod
@@ -495,7 +495,7 @@ class SyncState:
         return {k: v for k, v in blob.items() if k not in cls.SHARED_KEYS}
 
     @classmethod
-    def from_messages(cls, logger: logging.Logger, state: Optional[List[AirbyteStateMessage]]) -> "SyncState":
+    def from_messages(cls, logger: logging.Logger, state: Optional[List[AirbyteStateMessage]], selected: Set[StreamKey]) -> "SyncState":
         out = cls()
         if not state:
             return out
@@ -505,13 +505,26 @@ class SyncState:
                 blob = _blob_to_dict(message.stream.stream_state)
                 if "cursor" in blob:
                     descriptor = message.stream.stream_descriptor
-                    blobs[stream_key(descriptor.name, descriptor.namespace)] = blob
+                    key = stream_key(descriptor.name, descriptor.namespace)
+                    if key in selected:
+                        blobs[key] = blob
         if not blobs:
             logger.warning("No resumable Convex cursor in the incoming state; starting a fresh data sync.")
             return out
         try:
-            latest = max(blobs.values(), key=lambda c: c.get("checkpointed_at") or 0)
-            out.checkpoint_seq = int(latest.get("checkpointed_at") or 0)
+            out.checkpoint_seq = max(int(blob.get("checkpointed_at") or 0) for blob in blobs.values())
+            diverged = len({blob.get("cursor") for blob in blobs.values()}) > 1
+            candidates = [blob.get("replay_from") or blob for blob in blobs.values()] if diverged else list(blobs.values())
+            oldest = min(candidates, key=lambda c: int(c.get("checkpointed_at") or 0))
+            if diverged:
+                out.rewinding = True
+                out.replay_from = {key: oldest.get(key) for key in cls.SHARED_KEYS if key != "replay_from"}
+            elif not all(blob.get("up_to_date") for blob in blobs.values()):
+                # Agreement on a capped recovery page does not establish that it
+                # passed older checkpoints belonging to deselected streams.
+                rewind_points = [blob["replay_from"] for blob in blobs.values() if blob.get("replay_from")]
+                if rewind_points:
+                    out.replay_from = min(rewind_points, key=lambda c: int(c.get("checkpointed_at") or 0))
         except (TypeError, ValueError) as e:
             # Only hand-edited state gets here; the connector always writes integer stamps.
             raise AirbyteTracedException(
@@ -519,19 +532,12 @@ class SyncState:
                 internal_message=str(e),
                 failure_type=FailureType.config_error,
             ) from e
-        out.cursor = latest.get("cursor")
-        out.sync_id = latest.get("sync_id")
-        out.deployment_url = latest.get("deployment_url")
-        out.streams = {
-            key: cls._stream_keys(blob) for key, blob in blobs.items() if blob.get("checkpointed_at") == latest.get("checkpointed_at")
-        }
+        out.cursor = oldest.get("cursor")
+        out.sync_id = oldest.get("sync_id")
+        out.deployment_url = oldest.get("deployment_url")
+        out.up_to_date = oldest.get("up_to_date") is True
+        out.streams = {key: cls._stream_keys(blob) for key, blob in blobs.items()}
         return out
-
-    def restart(self) -> None:
-        """Forget the cursor and every per-stream flag: the next page starts a brand new data sync."""
-        self.cursor = None
-        self.sync_id = None
-        self.streams = {}
 
     def stream(self, key: StreamKey) -> Dict[str, Any]:
         return self.streams.setdefault(key, {})
@@ -547,6 +553,8 @@ class SyncState:
                 sync_id=self.sync_id,
                 deployment_url=self.deployment_url,
                 checkpointed_at=self.checkpoint_seq,
+                up_to_date=self.up_to_date,
+                **({"replay_from": self.replay_from} if self.replay_from else {}),
                 **self.streams.get((component, table), {}),
             )
             yield AirbyteMessage(
@@ -672,7 +680,7 @@ class SourceConvexDataSync(AbstractSource):
         if not catalog.streams:
             logger.info("No streams selected; nothing to sync.")
             return
-        sync_state = SyncState.from_messages(logger, state)
+        sync_state = SyncState.from_messages(logger, state, {stream_key(cs.stream.name, cs.stream.namespace) for cs in catalog.streams})
         if (
             sync_state.cursor is not None
             and sync_state.deployment_url is not None
@@ -714,7 +722,7 @@ class SourceConvexDataSync(AbstractSource):
 
         # Streams that must be re-sent from scratch on a resumed sync: full refresh streams (unless a previous
         # attempt's re-sync of them is still in progress, in which case Convex just carries on), and streams whose
-        # own state was cleared (the platform's per-stream reset), is stale, or that were never synced before.
+        # own state was cleared (the platform's per-stream reset), or that were never synced before.
         # Deselecting them for one page and reselecting them makes Convex re-sync them from scratch with a
         # leading truncate (documented ``selection`` semantics).
         full_refresh = {name for name, cs in selected.items() if cs.sync_mode == SyncMode.full_refresh}
@@ -726,21 +734,20 @@ class SourceConvexDataSync(AbstractSource):
                 for name in selected
                 # A full refresh stream whose flag is missing (older state) is re-snapshotted: that is the safe default.
                 if name not in sync_state.streams
-                or (name in full_refresh and sync_state.streams[name].get("snapshot_complete") is not False)
+                or (name in full_refresh and (sync_state.rewinding or sync_state.streams[name].get("snapshot_complete") is not False))
             }
             if resnapshot:
                 priming_selection = build_selection(key for key in selected if key not in resnapshot)
                 for name in resnapshot:
                     sync_state.stream(name)["snapshot_complete"] = False
+                    sync_state.stream(name)["awaiting_truncate"] = True
                 logger.info("Asking Convex to re-sync %s from scratch.", [_describe(key) for key in sorted(resnapshot)])
         for name in selected:
             sync_state.stream(name).setdefault("snapshot_complete", False)
 
-        # Convex truncates a table on the page where its fresh traversal begins: every table on a cold start and every
-        # re-selected one. A stream still without a truncate once the sync is up to date has no such table in the
-        # deployment; it would otherwise be reported complete with no rows and a typo in the schema JSON would go unnoticed.
-        expect_truncate: Set[StreamKey] = set(resnapshot) if resuming else set(selected)
-        truncated: Set[StreamKey] = set()
+        # A table's first truncate proves it exists, even if its snapshot spans runs.
+        for name in selected:
+            sync_state.stream(name).setdefault("awaiting_truncate", not resuming)
         missing: Set[StreamKey] = set()
 
         # A full refresh snapshot is only complete once the sync is up to date, and the platform clears full refresh
@@ -756,8 +763,7 @@ class SourceConvexDataSync(AbstractSource):
             max_pages = 0
 
         def checkpoint() -> Iterator[AirbyteMessage]:
-            # A missing table keeps no state, so the next run re-selects it and looks for its truncate again.
-            return sync_state.to_messages(key for key in selected if key not in missing)
+            return sync_state.to_messages(selected)
 
         def finish(status: AirbyteStreamStatus, checkpoint_state: bool = True) -> Iterator[AirbyteMessage]:
             if checkpoint_state:
@@ -778,28 +784,17 @@ class SourceConvexDataSync(AbstractSource):
                 try:
                     page = client.data_sync(sync_state.cursor, selection)
                 except ConvexApiError as e:
-                    if e.code in FOREIGN_CURSOR_ERROR_CODES and sync_state.cursor is not None:
+                    if e.code in UNUSABLE_CURSOR_ERROR_CODES and sync_state.cursor is not None:
+                        reason = (
+                            "The saved Convex cursor expired. A fresh snapshot cannot recover deletes from the expired history."
+                            if e.code == "DataSyncCursorExpired"
+                            else "Convex rejected the saved cursor. The deployment URL may have changed since the last sync."
+                        )
                         raise AirbyteTracedException(
-                            message=(
-                                "Convex rejected the saved sync cursor. This usually means the deployment URL changed since the "
-                                "last sync. Clear the connection's data so the new deployment is synced from scratch."
-                            ),
+                            message=f"{reason} Clear the connection's data and sync again.",
                             internal_message=str(e),
                             failure_type=FailureType.config_error,
                         ) from e
-                    # ``restart`` drops the cursor, so a second expiry error cannot loop: it falls through to ``raise``.
-                    if e.code in RESTART_ERROR_CODES and sync_state.cursor is not None:
-                        logger.warning(
-                            "Convex rejected the saved cursor (%s); restarting the data sync from scratch. Every table will be re-sent "
-                            "in full, but rows deleted since the last sync are not tombstoned, so reset the streams in the destination "
-                            "if you need an exact mirror.",
-                            e.code,
-                        )
-                        sync_state.restart()
-                        priming_selection = None
-                        expect_truncate = set(selected)
-                        truncated = set()
-                        continue
                     raise e.as_traced() from e
                 next_cursor = _next_cursor(page)
                 priming_selection = None
@@ -811,7 +806,7 @@ class SourceConvexDataSync(AbstractSource):
                     name = (truncate.get("component", ROOT_COMPONENT), truncate["table"])
                     if name not in selected:
                         continue
-                    truncated.add(name)
+                    sync_state.stream(name)["awaiting_truncate"] = False
                     if sync_state.snapshot_complete(name):
                         # Truncates during the initial snapshot are normal; after it they mean the table was replaced.
                         logger.warning(
@@ -847,10 +842,11 @@ class SourceConvexDataSync(AbstractSource):
                 sync_state.cursor = next_cursor
                 status_type = page.get("status", {}).get("type")
                 up_to_date = status_type == UP_TO_DATE_STATUS
+                sync_state.up_to_date = up_to_date and not priming
                 # The priming page describes a sync that still excludes the re-snapshot streams, so it never
                 # counts as complete for them.
                 if up_to_date and not priming:
-                    missing = expect_truncate - truncated
+                    missing = {name for name in selected if sync_state.stream(name).get("awaiting_truncate")}
                     if missing:
                         logger.warning(
                             "Convex never started syncing %s: these tables do not exist in the deployment (check the Table Schemas "

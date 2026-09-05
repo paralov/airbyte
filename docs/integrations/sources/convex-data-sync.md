@@ -1,7 +1,7 @@
 # Convex Data Sync
 
 This page contains the setup guide and reference information for the Convex Data Sync source connector.
-It is a separate connector from the original Convex source, built from the ground up on the Convex Deployment API.
+This connector uses the Convex Deployment API and supports component tables.
 
 Get started with Convex at the [Convex website](https://convex.dev).
 See your data on the [Convex dashboard](https://dashboard.convex.dev/).
@@ -58,24 +58,26 @@ path. A validator is the `.json` form of the table's `v.object({...})` from `con
 - Table and component names must be valid Convex identifiers (letters, digits and underscores, at most 64
   characters; table names cannot start with `_`). Anything else is rejected when the source is tested.
 
-To generate the object, walk your `convex.config.ts` for installed components and read every table's
-`validator.json` from each `schema.ts`. A small script that does this lives alongside your app; run it on
-the commit that is deployed and paste the output into the connector configuration. Re-run it after schema
-changes and refresh the source schema in Airbyte.
+Build this object from the deployed app's `schema.ts` files, including schemas of components installed
+through `convex.config.ts`. Use each table's `validator.json` and the component's installed path.
+Update the configuration and refresh the source schema in Airbyte after schema changes.
 
 ### State and sync behaviour
 
 One Convex data sync covers every selected table, so there is a single Convex cursor. The connector
-stores that same cursor in every stream's state at each checkpoint and resumes from the most recent
-one. Consequences:
+stores that same cursor in every stream's state at each checkpoint and resumes from the oldest saved
+checkpoint. This replays changes, including deletes, when only some streams acknowledged a checkpoint;
+already acknowledged records may be emitted again. Recovery checkpoints retain the rewind cursor until
+all selected streams acknowledge the same up-to-date cursor, so repeated partial failures remain resumable.
+
+- Deselected streams do not hold back the cursor.
 
 - Enabling a new stream makes Convex sync that table from scratch; nothing else is re-sent.
 - A Full Refresh stream, or a stream whose data you cleared in Airbyte, is deselected for one page
   and reselected, which makes Convex re-send it in full. Other streams keep streaming changes.
-- The cursor expires after 3 days without a sync. The connector then restarts from scratch and
-  re-sends everything. Incremental Dedupe destinations absorb the re-sent rows, but rows deleted
-  while the cursor was expired are not tombstoned, so reset the streams in the destination if you
-  need an exact mirror.
+- The cursor expires after 3 days without a sync. The connector fails with a reset instruction:
+  a fresh snapshot cannot recover deletes from the expired history. Clear the connection's data
+  and sync again to rebuild the destination.
 - The deployment URL is saved with the cursor. If its host no longer matches the source configuration, or
   Convex rejects the cursor (for example after changing the deployment URL), the sync fails with a
   configuration error instead of piling a fresh snapshot onto the old rows. Clear the connection's data
@@ -129,7 +131,6 @@ on transient errors.
 ### Setup guide
 
 On the [Convex dashboard](https://dashboard.convex.dev/), navigate to the project that you want to sync.
-Only "Production" deployments should be synced.
 
 1. Navigate to the Settings tab.
 2. Copy the "Deployment URL" from the settings page to the `deployment_url` field in Airbyte.

@@ -309,28 +309,15 @@ def test_read_skips_streams_missing_from_the_source(requests_mock, inline_config
     assert "comments" not in last_states(states)
 
 
-def test_read_restarts_on_expired_cursor(requests_mock, inline_config, catalog):
-    requests_mock.post(
-        SYNC_URL,
-        [
-            {"status_code": 400, "json": {"code": "DataSyncCursorExpired", "message": "expired"}},
-            {
-                "json": page(
-                    truncates=ALL_TRUNCATES,
-                    values=[value("", "posts", {"_id": "p1", "_creationTime": 1.0, "author": "u", "body": "b"})],
-                    cursor="n1",
-                    sync_id="sync-2",
-                )
-            },
-            {"json": page(cursor="n2", status={"type": "upToDate", "snapshotTs": 1}, sync_id="sync-2")},
-        ],
-    )
-    _, records, states, _ = run(inline_config, catalog, global_state("stale"))
-    assert requests_mock.request_history[0].json()["cursor"] == "stale"
-    assert "cursor" not in requests_mock.request_history[1].json()
-    assert [r.data["_id"] for r in records] == ["p1"]
-    assert shared(states[-1])["cursor"] == "n2"
-    assert shared(states[-1])["sync_id"] == "sync-2"
+def test_read_expired_cursor_requires_reset_instead_of_losing_deletes(requests_mock, inline_config, catalog):
+    requests_mock.post(SYNC_URL, status_code=400, json={"code": "DataSyncCursorExpired", "message": "expired"})
+    emitted = []
+    with pytest.raises(AirbyteTracedException) as err:
+        emitted.extend(SourceConvexDataSync().read(logger, inline_config, catalog, global_state("expired")))
+    assert err.value.failure_type == FailureType.config_error
+    assert "expired" in err.value.message and "Clear the connection's data" in err.value.message
+    assert len(requests_mock.request_history) == 1
+    assert not any(m.type in (Type.STATE, Type.RECORD) for m in emitted)
 
 
 def test_read_invalid_cursor_is_a_config_error(requests_mock, inline_config, catalog):
@@ -398,15 +385,25 @@ def test_read_retries_on_server_errors(requests_mock, inline_config, catalog, mo
     assert shared(states[-1])["cursor"] == "c1"
 
 
-def test_read_resumes_from_most_recent_checkpoint(requests_mock, inline_config, catalog):
-    requests_mock.post(SYNC_URL, [{"json": page(cursor="c9", status={"type": "upToDate", "snapshotTs": 1})}])
+@pytest.mark.parametrize("lagging", [POSTS, USER, RATE_LIMITS])
+def test_read_replays_unacknowledged_deletes(requests_mock, inline_config, catalog, lagging):
+    def replay(request, context):
+        assert request.json()["cursor"] == "old"
+        assert all(table in request.json()["selection"][component or ""] for component, table in (POSTS, USER, RATE_LIMITS))
+        return page(
+            values=[value(lagging[0] or "", lagging[1], {"_id": "deleted-row"}, deleted=True)],
+            cursor="next",
+            status={"type": "upToDate"},
+        )
+
+    requests_mock.post(SYNC_URL, json=replay)
     state = [
-        stream_state(POSTS, "old", checkpointed_at=1),
-        stream_state(USER, "newer", checkpointed_at=2),
-        stream_state(RATE_LIMITS, "old", checkpointed_at=1),
+        stream_state(key, "old" if key == lagging else "new", checkpointed_at=1 if key == lagging else 2, snapshot_complete=True)
+        for key in (POSTS, USER, RATE_LIMITS)
     ]
-    run(inline_config, catalog, state)
-    assert requests_mock.request_history[0].json()["cursor"] == "newer"
+    _, records, states, _ = run(inline_config, catalog, state)
+    assert [(ident(r), r.data["_id"], r.data["_deleted"]) for r in records] == [(lagging, "deleted-row", True)]
+    assert {shared(s)["checkpointed_at"] for s in states} == {3}
 
 
 def test_read_with_empty_catalog_makes_no_requests(requests_mock, inline_config, catalog):
@@ -465,32 +462,6 @@ def test_read_checkpoint_stamps_continue_the_incoming_sequence(requests_mock, in
     assert {shared(s)["checkpointed_at"] for s in states} == {1_788_466_011_117}
 
 
-def test_read_resnapshots_streams_with_stale_state_without_warning(requests_mock, inline_config, catalog, caplog):
-    # betterAuth/user was disabled for a few runs (the platform kept its old state) and is enabled again.
-    requests_mock.post(
-        SYNC_URL,
-        [
-            {"json": page(cursor="c9")},
-            {
-                "json": page(
-                    truncates=[{"component": "betterAuth", "table": "user"}], cursor="c10", status={"type": "upToDate", "snapshotTs": 1}
-                )
-            },
-        ],
-    )
-    state = [
-        stream_state(POSTS, "c8", checkpointed_at=8, snapshot_complete=True),
-        stream_state(USER, "c3", checkpointed_at=3, snapshot_complete=True),
-        stream_state(RATE_LIMITS, "c8", checkpointed_at=8, snapshot_complete=True),
-    ]
-    with caplog.at_level(logging.WARNING):
-        run(inline_config, catalog, state)
-    first, second = requests_mock.request_history[0].json(), requests_mock.request_history[1].json()
-    assert first["cursor"] == "c8" and "betterAuth" not in first["selection"]
-    assert "betterAuth" in second["selection"]
-    assert "truncated table" not in caplog.text
-
-
 def test_read_treats_stream_whose_namespace_disagrees_with_the_schema_as_missing(requests_mock, inline_config, catalog):
     # The schema JSON knows root/posts, but the catalog entry claims the table lives in betterAuth.
     catalog.streams[0] = configured_stream("betterAuth", "posts", USER_SCHEMA)
@@ -526,8 +497,8 @@ def test_read_reports_a_table_missing_from_the_deployment_incomplete(requests_mo
     ]
     assert incomplete == [RATE_LIMITS]
     assert statuses.count(AirbyteStreamStatus.COMPLETE) == 2
-    # No state for the missing stream: the next run re-selects it and checks for its truncate again.
-    assert set(last_states(states)) == {POSTS, USER}
+    assert last_states(states)[RATE_LIMITS]["awaiting_truncate"] is True
+    assert last_states(states)[RATE_LIMITS]["snapshot_complete"] is False
     assert last_states(states)[POSTS]["snapshot_complete"] is True
 
 
@@ -576,3 +547,130 @@ def test_read_through_the_cdk_entrypoint(requests_mock, inline_config, catalog):
     assert dict(vars(out.most_recent_state.stream_state))["cursor"] == "c2"
     checkpointed = {ident(s.state.stream.stream_descriptor) for s in out.state_messages}
     assert checkpointed == {POSTS, USER, RATE_LIMITS}
+
+
+@pytest.mark.parametrize("stop", ["page_cap", "failure"])
+@pytest.mark.parametrize("table_appears", [False, True])
+def test_read_retains_pending_table_checks_on_resume(requests_mock, inline_config, catalog, caplog, stop, table_appears):
+    inline_config["state_checkpoint_pages"] = 1
+    if stop == "page_cap":
+        inline_config["max_pages_per_sync"] = 1
+    requests_mock.post(
+        SYNC_URL,
+        [
+            {"json": page(truncates=[POSTS_TRUNCATE, USER_TRUNCATE], cursor="partial")},
+            {"status_code": 403, "json": {"code": "Forbidden"}},
+        ],
+    )
+    emitted = []
+    try:
+        emitted.extend(SourceConvexDataSync().read(logger, inline_config, catalog))
+    except AirbyteTracedException:
+        assert stop == "failure"
+    states = [m.state for m in emitted if m.type == Type.STATE]
+    requests_mock.post(
+        SYNC_URL, json=page(truncates=[RATE_LIMITS_TRUNCATE] if table_appears else [], cursor="done", status={"type": "upToDate"})
+    )
+    with caplog.at_level(logging.WARNING):
+        _, _, resumed_states, statuses = run(inline_config, catalog, states)
+    assert requests_mock.last_request.json()["cursor"] == "partial"
+    assert last_states(resumed_states)[RATE_LIMITS]["snapshot_complete"] is table_appears
+    assert (AirbyteStreamStatus.INCOMPLETE in statuses) is not table_appears
+    assert ("do not exist" in caplog.text) is not table_appears
+    assert last_states(resumed_states)[POSTS]["snapshot_complete"] is True
+
+
+def test_read_deselected_stream_does_not_hold_back_checkpoint(requests_mock, inline_config, catalog):
+    catalog.streams = catalog.streams[:2]
+    requests_mock.post(SYNC_URL, json=page(cursor="next", status={"type": "upToDate"}))
+    state = [
+        stream_state(POSTS, "current", checkpointed_at=5),
+        stream_state(USER, "current", checkpointed_at=5),
+        stream_state(RATE_LIMITS, "old", checkpointed_at=1),
+    ]
+    run(inline_config, catalog, state)
+    assert requests_mock.last_request.json()["cursor"] == "current"
+
+
+def test_read_keeps_rewind_point_across_repeated_partial_acknowledgements(requests_mock, inline_config, catalog):
+    inline_config["max_pages_per_sync"] = 1
+    state = [
+        stream_state(POSTS, "c1", checkpointed_at=1, snapshot_complete=True),
+        stream_state(USER, "c9", checkpointed_at=2, snapshot_complete=True),
+        stream_state(RATE_LIMITS, "c9", checkpointed_at=2, snapshot_complete=True),
+    ]
+    # Recovery gets only as far as c5, behind the previous attempt's c9. Only posts
+    # acknowledges this checkpoint. A sequence-number-only minimum would pick c9.
+    requests_mock.post(SYNC_URL, json=page(cursor="c5"))
+    _, _, states, _ = run(inline_config, catalog, state)
+    state[0] = next(s for s in states if ident(s.stream.stream_descriptor) == POSTS)
+    requests_mock.post(
+        SYNC_URL,
+        json=page(
+            values=[value("", "posts", {"_id": "deleted-between-c5-and-c9"}, deleted=True)],
+            cursor="c10",
+            status={"type": "upToDate"},
+        ),
+    )
+    _, records, states, _ = run(inline_config, catalog, state)
+    assert requests_mock.last_request.json()["cursor"] == "c1"
+    assert records[0].data["_id"] == "deleted-between-c5-and-c9"
+    assert records[0].data["_deleted"] is True
+    # Once every stream acknowledges c10, normal incremental progress resumes.
+    requests_mock.post(SYNC_URL, json=page(cursor="c11", status={"type": "upToDate"}))
+    _, _, states, _ = run(inline_config, catalog, states)
+    assert requests_mock.last_request.json()["cursor"] == "c10"
+    assert all("replay_from" not in shared(s) for s in states)
+
+
+def test_read_restarts_full_refresh_when_rewinding_before_its_snapshot(requests_mock, inline_config, catalog):
+    catalog.streams[1].sync_mode = SyncMode.full_refresh
+    state = [
+        stream_state(POSTS, "before-snapshot", checkpointed_at=1, snapshot_complete=True),
+        stream_state(USER, "during-snapshot", checkpointed_at=2, snapshot_complete=False),
+        stream_state(RATE_LIMITS, "during-snapshot", checkpointed_at=2, snapshot_complete=True),
+    ]
+    requests_mock.post(
+        SYNC_URL,
+        [
+            {"json": page(cursor="primed")},
+            {
+                "json": page(
+                    truncates=[USER_TRUNCATE],
+                    values=[value("betterAuth", "user", {"_id": "unchanged-row"})],
+                    cursor="done",
+                    status={"type": "upToDate"},
+                )
+            },
+        ],
+    )
+    _, records, _, _ = run(inline_config, catalog, state)
+    first, second = [r.json() for r in requests_mock.request_history]
+    assert first["cursor"] == "before-snapshot"
+    assert "betterAuth" not in first["selection"]
+    assert "betterAuth" in second["selection"]
+    assert records[0].data["_id"] == "unchanged-row"
+
+
+def test_read_preserves_rewind_point_when_ahead_stream_is_temporarily_deselected(requests_mock, inline_config, catalog):
+    inline_config["max_pages_per_sync"] = 1
+    ahead = stream_state(USER, "c9", checkpointed_at=2, snapshot_complete=True)
+    state = [
+        stream_state(POSTS, "c1", checkpointed_at=1, snapshot_complete=True),
+        ahead,
+        stream_state(RATE_LIMITS, "c9", checkpointed_at=2, snapshot_complete=True),
+    ]
+    requests_mock.post(SYNC_URL, json=page(cursor="c5"))
+    _, _, states, _ = run(inline_config, catalog, state)
+    # Only posts acknowledges c5; other streams are then deselected for a run.
+    posts_state = next(s for s in states if ident(s.stream.stream_descriptor) == POSTS)
+    original_streams = catalog.streams
+    catalog.streams = original_streams[:1]
+    requests_mock.post(SYNC_URL, json=page(cursor="c7"))
+    _, _, states, _ = run(inline_config, catalog, [posts_state, ahead])
+    assert requests_mock.last_request.json()["cursor"] == "c5"
+    # Re-enabling user must not let its lower sequence number choose c9 ahead of posts/c7.
+    catalog.streams = original_streams[:2]
+    requests_mock.post(SYNC_URL, json=page(cursor="c10", status={"type": "upToDate"}))
+    run(inline_config, catalog, [states[-1], ahead])
+    assert requests_mock.last_request.json()["cursor"] == "c1"
