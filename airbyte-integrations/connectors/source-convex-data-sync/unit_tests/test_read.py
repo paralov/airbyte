@@ -76,6 +76,21 @@ def last_states(states):
     return out
 
 
+@pytest.mark.parametrize("replay_from", ["c1", ["c1"], 1, False, "", []])
+@pytest.mark.parametrize("diverged", [False, True])
+def test_read_rejects_non_object_replay_state(requests_mock, inline_config, catalog, replay_from, diverged):
+    state = [
+        stream_state(POSTS, "c1", replay_from=replay_from),
+        stream_state(USER, "c2" if diverged else "c1"),
+    ]
+    with pytest.raises(AirbyteTracedException) as exc:
+        run(inline_config, catalog, state)
+    assert exc.value.failure_type == FailureType.config_error
+    assert "replay_from is not an object" in exc.value.message
+    assert "Clear the connection's data" in exc.value.message
+    assert requests_mock.call_count == 0
+
+
 def test_read_routes_records_by_component(requests_mock, inline_config, catalog):
     requests_mock.post(
         SYNC_URL,

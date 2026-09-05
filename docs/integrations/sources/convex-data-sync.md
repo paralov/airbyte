@@ -63,7 +63,7 @@ Build this object from the deployed app's `schema.ts` files, including schemas o
 through `convex.config.ts`. Use each table's `validator.json` and the component's installed path.
 Update the configuration and refresh the source schema in Airbyte after schema changes.
 
-### State and sync behaviour
+### State and sync behavior
 
 One Convex data sync covers every selected table, so there is a single Convex cursor. The connector
 stores that same cursor in every stream's state at each checkpoint and resumes from the oldest saved

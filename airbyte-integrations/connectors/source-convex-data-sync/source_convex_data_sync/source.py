@@ -524,6 +524,13 @@ class SyncState:
         if not blobs:
             logger.warning("No resumable Convex cursor in the incoming state; starting a fresh data sync.")
             return out
+        for blob in blobs.values():
+            replay_from = blob.get("replay_from")
+            if replay_from is not None and not isinstance(replay_from, Mapping):
+                raise AirbyteTracedException(
+                    message="The saved state's replay_from is not an object. Clear the connection's data and sync again.",
+                    failure_type=FailureType.config_error,
+                )
         try:
             out.checkpoint_seq = max(int(blob.get("checkpointed_at") or 0) for blob in blobs.values())
             diverged = len({blob.get("cursor") for blob in blobs.values()}) > 1
