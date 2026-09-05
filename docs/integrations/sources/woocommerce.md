@@ -33,10 +33,10 @@ For more details, see the [WooCommerce REST API authentication documentation](ht
 1. [Log into your Airbyte Cloud](https://cloud.airbyte.com/workspaces) account.
 2. In the left navigation bar, click **Sources**. In the top-right corner, click **+ New source**.
 3. Select **WooCommerce** from the Source type dropdown and enter a name for the connector.
-4. Enter the **Consumer key** and **Consumer secret** from Step 1.
+4. Enter the consumer key from Step 1 into the **Customer Key** field, and the consumer secret into the **Customer Secret** field.
 5. Enter the **Shop Name**. For `https://EXAMPLE.com`, the shop name is `EXAMPLE.com`.
 6. Choose the **Start Date** to begin syncing data from.
-7. (Optional) Adjust the **Number of Concurrent Workers** to control sync parallelism. The default is 4. Higher values can speed up syncs but may cause rate limiting depending on your hosting provider. Valid range: 2-12.
+7. (Optional) Adjust the **Number of Concurrent Threads** to control sync parallelism. The default is 5. Higher values can speed up syncs but may cause rate limiting depending on your hosting provider. Valid range: 2-12.
 
 <!-- /env:cloud -->
 <!-- env:oss -->
@@ -46,10 +46,10 @@ For more details, see the [WooCommerce REST API authentication documentation](ht
 1. Navigate to the Airbyte Open Source dashboard.
 2. Click **Sources**, then click **+ New source**.
 3. Select **WooCommerce** from the Source type dropdown and enter a name for the connector.
-4. Enter the **Consumer key** and **Consumer secret** from Step 1.
+4. Enter the consumer key from Step 1 into the **Customer Key** field, and the consumer secret into the **Customer Secret** field.
 5. Enter the **Shop Name**. For `https://EXAMPLE.com`, the shop name is `EXAMPLE.com`.
 6. Choose the **Start Date** to begin syncing data from.
-7. (Optional) Adjust the **Number of Concurrent Workers** to control sync parallelism. The default is 4. Higher values can speed up syncs but may cause rate limiting depending on your hosting provider. Valid range: 2-12.
+7. (Optional) Adjust the **Number of Concurrent Threads** to control sync parallelism. The default is 5. Higher values can speed up syncs but may cause rate limiting depending on your hosting provider. Valid range: 2-12.
 <!-- /env:oss -->
 
 ## Supported sync modes
@@ -98,9 +98,13 @@ Expand to see details about WooCommerce connector limitations and troubleshootin
 
 The WooCommerce REST API does not enforce built-in rate limits. Actual rate limits depend on your hosting provider. Shared hosting environments typically allow 2-5 requests per second. The connector applies a default rate budget of 5 requests per second and handles HTTP 429 responses automatically.
 
-If your hosting environment supports higher throughput, you can increase the **Number of Concurrent Workers** setting (up to 12) in the connector configuration to speed up syncs. If you experience rate limiting errors, reduce this value.
+If your hosting environment supports higher throughput, you can increase the **Number of Concurrent Threads** setting (up to 12) in the connector configuration to speed up syncs. If you experience rate limiting errors, reduce this value.
 
 </details>
+
+## IP allow list
+
+If you use Airbyte Cloud and your organization restricts access to specific IPs, add the [Airbyte Cloud IP addresses](https://docs.airbyte.com/platform/operating-airbyte/ip-allowlist) to your allow list.
 
 ## Changelog
 
@@ -109,6 +113,21 @@ If your hosting environment supports higher throughput, you can increase the **N
 
 | Version | Date       | Pull Request                                             | Subject                                                                |
 |:--------| :--------- |:---------------------------------------------------------|:-----------------------------------------------------------------------|
+| 0.5.49 | 2026-08-25 | [85030](https://github.com/airbytehq/airbyte/pull/85030) | Skip product attributes whose WooCommerce taxonomy no longer exists instead of failing the sync |
+| 0.5.48 | 2026-08-18 | [84829](https://github.com/airbytehq/airbyte/pull/84829) | Update dependencies |
+| 0.5.47 | 2026-08-11 | [84188](https://github.com/airbytehq/airbyte/pull/84188) | Update dependencies |
+| 0.5.46 | 2026-08-04 | [83676](https://github.com/airbytehq/airbyte/pull/83676) | Update dependencies |
+| 0.5.45 | 2026-07-28 | [83185](https://github.com/airbytehq/airbyte/pull/83185) | Update dependencies |
+| 0.5.44 | 2026-07-21 | [82669](https://github.com/airbytehq/airbyte/pull/82669) | Update dependencies |
+| 0.5.43 | 2026-07-14 | [82068](https://github.com/airbytehq/airbyte/pull/82068) | Update dependencies |
+| 0.5.42 | 2026-06-30 | [81312](https://github.com/airbytehq/airbyte/pull/81312) | Update dependencies |
+| 0.5.41 | 2026-06-23 | [80712](https://github.com/airbytehq/airbyte/pull/80712) | Update dependencies |
+| 0.5.40 | 2026-06-16 | [80112](https://github.com/airbytehq/airbyte/pull/80112) | Update dependencies |
+| 0.5.39 | 2026-06-09 | [79578](https://github.com/airbytehq/airbyte/pull/79578) | Update dependencies |
+| 0.5.38 | 2026-06-02 | [79058](https://github.com/airbytehq/airbyte/pull/79058) | Update dependencies |
+| 0.5.37 | 2026-04-28 | [77469](https://github.com/airbytehq/airbyte/pull/77469) | Update dependencies |
+| 0.5.36 | 2026-04-21 | [76804](https://github.com/airbytehq/airbyte/pull/76804) | Update dependencies |
+| 0.5.35 | 2026-04-14 | [76330](https://github.com/airbytehq/airbyte/pull/76330) | Promoted release candidate to GA |
 | 0.5.35-rc.2 | 2026-04-12 | [76253](https://github.com/airbytehq/airbyte/pull/76253) | Increase default concurrency from 4 to 5 for tuning iteration 2 |
 | 0.5.35-rc.1 | 2026-04-10 | [76205](https://github.com/airbytehq/airbyte/pull/76205) | Add concurrency_level and num_workers for concurrent stream syncing |
 | 0.5.34 | 2026-03-31 | [75853](https://github.com/airbytehq/airbyte/pull/75853) | Update dependencies |
@@ -116,7 +135,7 @@ If your hosting environment supports higher throughput, you can increase the **N
 | 0.5.32 | 2026-03-10 | [74674](https://github.com/airbytehq/airbyte/pull/74674) | Update dependencies |
 | 0.5.31 | 2026-02-24 | [73889](https://github.com/airbytehq/airbyte/pull/73889) | Update dependencies |
 | 0.5.30 | 2026-02-10 | [72988](https://github.com/airbytehq/airbyte/pull/72988) | Update dependencies |
-| 0.5.29 | 2026-02-03 | [72658](https://github.com/airbytehq/airbyte/pull/72658) | Update dependencies |
+| 0.5.29 | 2026-02-06 | [72658](https://github.com/airbytehq/airbyte/pull/72658) | Update dependencies |
 | 0.5.28 | 2026-01-20 | [72054](https://github.com/airbytehq/airbyte/pull/72054) | Update dependencies |
 | 0.5.27 | 2026-01-14 | [71438](https://github.com/airbytehq/airbyte/pull/71438) | Update dependencies |
 | 0.5.26 | 2025-12-19 | [70708](https://github.com/airbytehq/airbyte/pull/70708) | Update dependencies |
@@ -140,13 +159,13 @@ If your hosting environment supports higher throughput, you can increase the **N
 | 0.5.8 | 2025-06-28 | [62259](https://github.com/airbytehq/airbyte/pull/62259) | Update dependencies |
 | 0.5.7 | 2025-06-21 | [61763](https://github.com/airbytehq/airbyte/pull/61763) | Update dependencies |
 | 0.5.6 | 2025-06-15 | [61474](https://github.com/airbytehq/airbyte/pull/61474) | Update dependencies |
-| 0.5.5 | 2025-05-31 | [51438](https://github.com/airbytehq/airbyte/pull/51438) | Update dependencies |
+| 0.5.5 | 2025-06-04 | [51438](https://github.com/airbytehq/airbyte/pull/51438) | Update dependencies |
 | 0.5.4 | 2024-12-28 | [50800](https://github.com/airbytehq/airbyte/pull/50800) | Update dependencies |
 | 0.5.3 | 2024-12-21 | [50335](https://github.com/airbytehq/airbyte/pull/50335) | Update dependencies |
 | 0.5.2 | 2024-12-14 | [49382](https://github.com/airbytehq/airbyte/pull/49382) | Update dependencies |
 | 0.5.1 | 2024-12-11 | [47510](https://github.com/airbytehq/airbyte/pull/47510) | Starting with this version, the Docker image is now rootless. Please note that this and future versions will not be compatible with Airbyte versions earlier than 0.64 |
 | 0.5.0 | 2024-10-16 | [46956](https://github.com/airbytehq/airbyte/pull/46956) | Promoting release candidate 0.5.0-rc.1 to a main version. |
-| 0.5.0-rc.1  | 2024-10-08 | [46575](https://github.com/airbytehq/airbyte/pull/46575) | Migrate to Manifest-only |
+| 0.5.0-rc.1 | 2024-10-08 | [46575](https://github.com/airbytehq/airbyte/pull/46575) | Migrate to Manifest-only |
 | 0.4.12 | 2024-10-12 | [46806](https://github.com/airbytehq/airbyte/pull/46806) | Update dependencies |
 | 0.4.11 | 2024-10-05 | [46423](https://github.com/airbytehq/airbyte/pull/46423) | Update dependencies |
 | 0.4.10 | 2024-09-28 | [46193](https://github.com/airbytehq/airbyte/pull/46193) | Update dependencies |
