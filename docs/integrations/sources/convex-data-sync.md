@@ -76,24 +76,29 @@ one. Consequences:
   re-sends everything. Incremental Dedupe destinations absorb the re-sent rows, but rows deleted
   while the cursor was expired are not tombstoned, so reset the streams in the destination if you
   need an exact mirror.
-- If the saved cursor does not belong to the deployment (for example after changing the deployment URL),
-  the sync fails with a configuration error instead of piling a fresh snapshot onto the old rows. Clear the
-  connection's data and sync again.
+- The deployment URL is saved with the cursor. If its host no longer matches the source configuration, or
+  Convex rejects the cursor (for example after changing the deployment URL), the sync fails with a
+  configuration error instead of piling a fresh snapshot onto the old rows. Clear the connection's data
+  and sync again.
 - A Full Refresh stream is only complete once the sync is up to date, and Airbyte clears Full Refresh
   state between jobs, so its snapshot has to finish within one run: "Max Pages Per Sync" is not applied
   while Full Refresh streams are selected. If a run fails midway, the retry attempt continues the
-  snapshot. Tombstones are never emitted into Full Refresh streams.
-- The deployment URL is saved with the cursor. If it no longer matches the source configuration, the
-  sync fails with a configuration error before contacting the new deployment.
+  snapshot. Tombstones are never emitted into Full Refresh streams, so a document deleted while its
+  snapshot was still in progress can survive in the destination until the next run; use Incremental
+  Dedupe for an exact mirror.
 - If Convex truncates a table (for example after `npx convex import --replace`), the connector logs
   a warning and the table is re-sent in full. Rows deleted by the truncate are not tombstoned, so
   reset that stream in the destination if you need an exact mirror.
-- A sync stops at the first page on which Convex reports the export is up to date; that page is a
-  consistent snapshot of every selected table. Set "Max Pages Per Sync" to bound very large initial
-  syncs; the next run resumes from the saved cursor.
+- A sync stops at the first page on which Convex reports the export is up to date; the Incremental
+  streams then hold a consistent snapshot of every selected table. Set "Max Pages Per Sync" to bound
+  very large initial syncs, and deployments written faster than the connector reads them (Convex may
+  never report such a sync up to date); the next run resumes from the saved cursor.
 - A stream that is still in the connection but no longer in the table schemas is not synced: the
   connector logs a warning and reports that stream incomplete on every run (the other streams sync
   normally) until you refresh the source schema and remove it.
+- A table in the schema JSON that does not exist in the deployment (a typo, or a table not created yet)
+  receives no data: the connector logs a warning and reports that stream incomplete on every run until
+  the table exists. The other streams are unaffected.
 
 ### Features
 

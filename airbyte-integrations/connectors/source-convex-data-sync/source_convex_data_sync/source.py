@@ -24,12 +24,16 @@ See https://docs.convex.dev/deployment-api/data-sync.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
+import math
 import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Set, Tuple
+from urllib.parse import urlsplit
 
 import requests
 
@@ -63,6 +67,8 @@ CONVEX_CLIENT_VERSION = "0.1.0"
 CONVEX_CLIENT_HEADER = f"airbyte-export-{CONVEX_CLIENT_VERSION}"
 
 ROOT_COMPONENT = ""
+# Reserved key at every level of a Convex ``selection``: the default for names not listed explicitly.
+SELECTION_OTHER = "_other"
 
 # Convex table and component names are identifiers of at most 64 characters; user tables never start with ``_``.
 CONVEX_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
@@ -164,9 +170,12 @@ def _retry_delay(resp: Optional[requests.Response], attempt: int) -> float:
     retry_after = resp.headers.get("Retry-After") if resp is not None else None
     if retry_after:
         try:
-            return min(max(float(retry_after), 0.0), MAX_RETRY_AFTER_SECONDS)
+            seconds = float(retry_after)
         except ValueError:
-            pass  # HTTP-date form; fall back to exponential backoff.
+            seconds = math.nan  # HTTP-date form; fall back to exponential backoff.
+        # ``float`` also accepts "nan" and "inf", which survive the clamp and make ``time.sleep`` raise.
+        if math.isfinite(seconds):
+            return min(max(seconds, 0.0), MAX_RETRY_AFTER_SECONDS)
     return min(2**attempt, MAX_BACKOFF_SECONDS)
 
 
@@ -254,6 +263,21 @@ BYTES_SCHEMA: Dict[str, Any] = {"type": "object", "properties": {"$bytes": {"typ
 FLOAT_SCHEMA: Dict[str, Any] = {"anyOf": [{"type": "number"}, {"type": "object", "properties": {"$float": {"type": "string"}}}]}
 
 
+def _invalid_validator(detail: str) -> AirbyteTracedException:
+    return AirbyteTracedException(message=f"Invalid Convex validator in the schema JSON: {detail}.", failure_type=FailureType.config_error)
+
+
+def _int64_literal(encoded: str) -> int:
+    """``v.literal(5n)`` serialises its value as ``{"$integer": <base64 little-endian int64>}``."""
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise _invalid_validator(f"literal {{'$integer': {encoded!r}}} is not base64") from e
+    if len(raw) != 8:
+        raise _invalid_validator(f"literal {{'$integer': {encoded!r}}} is not an int64")
+    return int.from_bytes(raw, "little", signed=True)
+
+
 def validator_to_json_schema(validator: Mapping[str, Any]) -> Dict[str, Any]:
     """Convert Convex validator JSON (the ``.json`` of ``v.object({...})`` etc.) to a draft-07 JSON Schema.
 
@@ -261,7 +285,12 @@ def validator_to_json_schema(validator: Mapping[str, Any]) -> Dict[str, Any]:
     them verbatim rather than inventing its own format. Nested objects never set ``additionalProperties: false``:
     Airbyte requires every ``additionalProperties`` in a stream schema to be true, and it keeps records valid
     when a nested field is added in Convex before the schema here is refreshed.
+
+    The JSON is user-supplied, so every nested shape is checked and a malformed one is a config error rather
+    than a stack trace out of check/discover/read.
     """
+    if not isinstance(validator, Mapping):
+        raise _invalid_validator(f"expected a validator object, got {validator!r}")
     kind = validator.get("type")
     if kind == "null":
         return {"type": "null"}
@@ -279,7 +308,12 @@ def validator_to_json_schema(validator: Mapping[str, Any]) -> Dict[str, Any]:
         return dict(BYTES_SCHEMA)
     if kind == "literal":
         value = validator.get("value")
-        json_type = {bool: "boolean", int: "number", float: "number", str: "string"}.get(type(value), "string")
+        if isinstance(value, Mapping) and isinstance(value.get("$integer"), str):
+            # The data sync export ships int64 values as plain JSON numbers, so the enum holds the decoded integer.
+            return {"type": "integer", "enum": [_int64_literal(value["$integer"])]}
+        json_type = {bool: "boolean", int: "number", float: "number", str: "string"}.get(type(value))
+        if json_type is None:
+            raise _invalid_validator(f"unsupported literal value {value!r}")
         return {"type": json_type, "enum": [value]}
     if kind == "id":
         return {"type": "string", "$description": f"Id({validator.get('tableName', '?')})"}
@@ -288,17 +322,24 @@ def validator_to_json_schema(validator: Mapping[str, Any]) -> Dict[str, Any]:
     if kind == "record":
         return {"type": "object", "additionalProperties": True}
     if kind == "object":
+        fields = validator.get("value") or {}
+        if not isinstance(fields, Mapping):
+            raise _invalid_validator(f"object fields must be an object, got {fields!r}")
         properties: Dict[str, Any] = {}
         required: List[str] = []
-        for name, field in (validator.get("value") or {}).items():
-            field_type = field.get("fieldType") if isinstance(field, dict) and "fieldType" in field else field
+        for name, field in fields.items():
+            field_type = field.get("fieldType") if isinstance(field, Mapping) and "fieldType" in field else field
             properties[name] = validator_to_json_schema(field_type or {"type": "any"})
-            if not (isinstance(field, dict) and field.get("optional")):
+            if not (isinstance(field, Mapping) and field.get("optional")):
                 required.append(name)
         return {"type": "object", "properties": properties, "required": required}
     if kind == "union":
-        return {"anyOf": [validator_to_json_schema(member) for member in validator.get("value") or []]}
-    raise AirbyteTracedException(message=f"Unknown Convex validator type {kind!r}.", failure_type=FailureType.config_error)
+        members = validator.get("value")
+        if not isinstance(members, list) or not members:
+            # ``{"anyOf": []}`` is not valid draft-07, so an empty union cannot become a stream schema.
+            raise _invalid_validator(f"a union needs a non-empty list of members, got {members!r}")
+        return {"anyOf": [validator_to_json_schema(member) for member in members]}
+    raise _invalid_validator(f"unknown validator type {kind!r}")
 
 
 def _check_table_identifiers(component: str, table: str) -> None:
@@ -307,6 +348,12 @@ def _check_table_identifiers(component: str, table: str) -> None:
         if not CONVEX_IDENTIFIER.match(segment):
             raise AirbyteTracedException(
                 message=f'Schema entry {component!r} is not a valid Convex component path (use "" for the root component).',
+                failure_type=FailureType.config_error,
+            )
+        if segment == SELECTION_OTHER:
+            # The identifier grammar allows it, but a selection can never address a component by that name.
+            raise AirbyteTracedException(
+                message=f"Schema entry {component!r}: {SELECTION_OTHER!r} is reserved in Convex selections and cannot name a component.",
                 failure_type=FailureType.config_error,
             )
     if not CONVEX_IDENTIFIER.match(table) or table.startswith("_"):
@@ -425,14 +472,16 @@ class SyncState:
     cursor wins, and only streams that took part in that checkpoint keep their
     per-stream bookkeeping. A stream whose state is older (it was deselected for
     a while, or its checkpoint was not persisted) is re-synced from scratch, just
-    like one whose state was cleared.
+    like one whose state was cleared. That re-sync re-sends the whole table
+    (duplicate rows on an append destination): the price of the platform
+    persisting one stream's checkpoint behind the others' after a failed attempt,
+    which a single GLOBAL state message would avoid if the entrypoint accepted one.
 
     The deployment URL is stored alongside the cursor so a cursor is never sent to a
     different deployment than the one that minted it.
     """
 
-    # ``selection_hash`` is no longer written; it stays here so older state is not mistaken for per-stream bookkeeping.
-    SHARED_KEYS = ("cursor", "sync_id", "deployment_url", "checkpointed_at", "selection_hash")
+    SHARED_KEYS = ("cursor", "sync_id", "deployment_url", "checkpointed_at")
 
     def __init__(self) -> None:
         self.cursor: Optional[str] = None
@@ -460,11 +509,19 @@ class SyncState:
         if not blobs:
             logger.warning("No resumable Convex cursor in the incoming state; starting a fresh data sync.")
             return out
-        latest = max(blobs.values(), key=lambda c: c.get("checkpointed_at") or 0)
+        try:
+            latest = max(blobs.values(), key=lambda c: c.get("checkpointed_at") or 0)
+            out.checkpoint_seq = int(latest.get("checkpointed_at") or 0)
+        except (TypeError, ValueError) as e:
+            # Only hand-edited state gets here; the connector always writes integer stamps.
+            raise AirbyteTracedException(
+                message="The saved state's checkpointed_at is not a number. Clear the connection's data and sync again.",
+                internal_message=str(e),
+                failure_type=FailureType.config_error,
+            ) from e
         out.cursor = latest.get("cursor")
         out.sync_id = latest.get("sync_id")
         out.deployment_url = latest.get("deployment_url")
-        out.checkpoint_seq = int(latest.get("checkpointed_at") or 0)
         out.streams = {
             key: cls._stream_keys(blob) for key, blob in blobs.items() if blob.get("checkpointed_at") == latest.get("checkpointed_at")
         }
@@ -512,13 +569,18 @@ def _describe(key: StreamKey) -> str:
     return f"{key[0] or '<root>'}/{key[1]}"
 
 
-def build_selection(pairs: Iterable[Tuple[str, str]]) -> Dict[str, Any]:
+def build_selection(pairs: Iterable[StreamKey]) -> Dict[str, Any]:
     """Convex ``selection`` body that includes exactly the given ``(component, table)`` pairs."""
-    selection: Dict[str, Any] = {"_other": "excluded"}
+    selection: Dict[str, Any] = {SELECTION_OTHER: "excluded"}
     for component, table in pairs:
-        component_selection = selection.setdefault(component, {"_other": "excluded"})
-        component_selection[table] = {"_other": "included"}
+        component_selection = selection.setdefault(component, {SELECTION_OTHER: "excluded"})
+        component_selection[table] = {SELECTION_OTHER: "included"}
     return selection
+
+
+def _deployment_host(url: str) -> str:
+    """What identifies a deployment in its URL: scheme, case and trailing slashes do not."""
+    return urlsplit(url).netloc.lower()
 
 
 def _record_from_value(value: Mapping[str, Any]) -> Dict[str, Any]:
@@ -611,7 +673,11 @@ class SourceConvexDataSync(AbstractSource):
             logger.info("No streams selected; nothing to sync.")
             return
         sync_state = SyncState.from_messages(logger, state)
-        if sync_state.cursor is not None and sync_state.deployment_url not in (None, client.deployment_url):
+        if (
+            sync_state.cursor is not None
+            and sync_state.deployment_url is not None
+            and _deployment_host(sync_state.deployment_url) != _deployment_host(client.deployment_url)
+        ):
             raise AirbyteTracedException(
                 message=(
                     f"The saved sync cursor belongs to the deployment {sync_state.deployment_url}, but the source is now configured "
@@ -653,6 +719,7 @@ class SourceConvexDataSync(AbstractSource):
         # leading truncate (documented ``selection`` semantics).
         full_refresh = {name for name, cs in selected.items() if cs.sync_mode == SyncMode.full_refresh}
         priming_selection: Optional[Dict[str, Any]] = None
+        resnapshot: Set[StreamKey] = set()
         if resuming:
             resnapshot = {
                 name
@@ -669,6 +736,13 @@ class SourceConvexDataSync(AbstractSource):
         for name in selected:
             sync_state.stream(name).setdefault("snapshot_complete", False)
 
+        # Convex truncates a table on the page where its fresh traversal begins: every table on a cold start and every
+        # re-selected one. A stream still without a truncate once the sync is up to date has no such table in the
+        # deployment; it would otherwise be reported complete with no rows and a typo in the schema JSON would go unnoticed.
+        expect_truncate: Set[StreamKey] = set(resnapshot) if resuming else set(selected)
+        truncated: Set[StreamKey] = set()
+        missing: Set[StreamKey] = set()
+
         # A full refresh snapshot is only complete once the sync is up to date, and the platform clears full refresh
         # state between jobs, so stopping early would make the next run start the snapshot over: the page cap is not
         # applied while full refresh streams are selected.
@@ -681,17 +755,20 @@ class SourceConvexDataSync(AbstractSource):
             )
             max_pages = 0
 
-        def finish(status: AirbyteStreamStatus, checkpoint: bool = True) -> Iterator[AirbyteMessage]:
-            if checkpoint:
-                yield from sync_state.to_messages(selected.keys())
-            for cs in selected.values():
-                yield stream_status_message(cs.stream, status)
+        def checkpoint() -> Iterator[AirbyteMessage]:
+            # A missing table keeps no state, so the next run re-selects it and looks for its truncate again.
+            return sync_state.to_messages(key for key in selected if key not in missing)
+
+        def finish(status: AirbyteStreamStatus, checkpoint_state: bool = True) -> Iterator[AirbyteMessage]:
+            if checkpoint_state:
+                yield from checkpoint()
+            for key, cs in selected.items():
+                yield stream_status_message(cs.stream, AirbyteStreamStatus.INCOMPLETE if key in missing else status)
 
         running_emitted: Set[StreamKey] = set()
         dropped: Dict[StreamKey, int] = {}
         pages = 0
         records = 0
-        restarted = False
         status_type: Optional[str] = None
 
         try:
@@ -710,7 +787,8 @@ class SourceConvexDataSync(AbstractSource):
                             internal_message=str(e),
                             failure_type=FailureType.config_error,
                         ) from e
-                    if e.code in RESTART_ERROR_CODES and sync_state.cursor is not None and not restarted:
+                    # ``restart`` drops the cursor, so a second expiry error cannot loop: it falls through to ``raise``.
+                    if e.code in RESTART_ERROR_CODES and sync_state.cursor is not None:
                         logger.warning(
                             "Convex rejected the saved cursor (%s); restarting the data sync from scratch. Every table will be re-sent "
                             "in full, but rows deleted since the last sync are not tombstoned, so reset the streams in the destination "
@@ -719,7 +797,8 @@ class SourceConvexDataSync(AbstractSource):
                         )
                         sync_state.restart()
                         priming_selection = None
-                        restarted = True
+                        expect_truncate = set(selected)
+                        truncated = set()
                         continue
                     raise e.as_traced() from e
                 next_cursor = _next_cursor(page)
@@ -732,6 +811,7 @@ class SourceConvexDataSync(AbstractSource):
                     name = (truncate.get("component", ROOT_COMPONENT), truncate["table"])
                     if name not in selected:
                         continue
+                    truncated.add(name)
                     if sync_state.snapshot_complete(name):
                         # Truncates during the initial snapshot are normal; after it they mean the table was replaced.
                         logger.warning(
@@ -770,11 +850,19 @@ class SourceConvexDataSync(AbstractSource):
                 # The priming page describes a sync that still excludes the re-snapshot streams, so it never
                 # counts as complete for them.
                 if up_to_date and not priming:
+                    missing = expect_truncate - truncated
+                    if missing:
+                        logger.warning(
+                            "Convex never started syncing %s: these tables do not exist in the deployment (check the Table Schemas "
+                            "field for typos). They are reported incomplete; the other streams are complete.",
+                            [_describe(key) for key in sorted(missing)],
+                        )
                     for name in selected:
-                        sync_state.stream(name)["snapshot_complete"] = True
+                        if name not in missing:
+                            sync_state.stream(name)["snapshot_complete"] = True
 
                 if pages % checkpoint_pages == 0:
-                    yield from sync_state.to_messages(selected.keys())
+                    yield from checkpoint()
 
                 if priming:
                     continue  # Always fetch at least one page with the full selection so the deselected tables come back.
@@ -790,7 +878,7 @@ class SourceConvexDataSync(AbstractSource):
         except Exception:
             # With no page fetched the cursor has not moved: leave the previous checkpoint alone rather than persist the
             # snapshot_complete=False flags set above, which would make the next attempt skip the re-snapshot.
-            yield from finish(AirbyteStreamStatus.INCOMPLETE, checkpoint=pages > 0)
+            yield from finish(AirbyteStreamStatus.INCOMPLETE, checkpoint_state=pages > 0)
             raise
 
         yield from finish(AirbyteStreamStatus.COMPLETE)
@@ -798,6 +886,6 @@ class SourceConvexDataSync(AbstractSource):
             logger.warning(
                 "Dropped %d documents from tables not in the configured catalog: %s",
                 sum(dropped.values()),
-                ", ".join(f"{c or '<root>'}/{t}={n}" for (c, t), n in sorted(dropped.items())),
+                ", ".join(f"{_describe(key)}={n}" for key, n in sorted(dropped.items())),
             )
         logger.info("Convex data sync %s: %d pages, %d records, status=%s", sync_state.sync_id, pages, records, status_type or "none")

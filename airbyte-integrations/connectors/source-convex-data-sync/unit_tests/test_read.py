@@ -18,10 +18,27 @@ from airbyte_cdk.models import (
     Type,
 )
 from airbyte_cdk.utils.traced_exception import AirbyteTracedException, FailureType
-from unit_tests.helpers import POSTS, RATE_LIMITS, SYNC_URL, USER, configured_stream, ident, page, value
+from unit_tests.helpers import (
+    POSTS,
+    POSTS_SCHEMA,
+    RATE_LIMITS,
+    SYNC_URL,
+    USER,
+    USER_SCHEMA,
+    configured_stream,
+    ident,
+    page,
+    value,
+)
 
 
 logger = logging.getLogger("airbyte")
+
+# Convex truncates every selected table on the page where its traversal begins, so a cold start sends these.
+POSTS_TRUNCATE = {"component": "", "table": "posts"}
+USER_TRUNCATE = {"component": "betterAuth", "table": "user"}
+RATE_LIMITS_TRUNCATE = {"component": "resend/rateLimiter", "table": "rateLimits"}
+ALL_TRUNCATES = [POSTS_TRUNCATE, USER_TRUNCATE, RATE_LIMITS_TRUNCATE]
 
 
 def run(config, catalog, state=None):
@@ -63,7 +80,7 @@ def test_read_routes_records_by_component(requests_mock, inline_config, catalog)
     requests_mock.post(
         SYNC_URL,
         [
-            {"json": page(truncates=[{"component": "", "table": "posts"}, {"component": "betterAuth", "table": "user"}], cursor="c1")},
+            {"json": page(truncates=ALL_TRUNCATES, cursor="c1")},
             {
                 "json": page(
                     values=[
@@ -246,7 +263,7 @@ def test_read_does_not_checkpoint_when_the_priming_page_fails(requests_mock, inl
 
 
 def test_read_refuses_a_cursor_saved_for_another_deployment(requests_mock, inline_config, catalog):
-    requests_mock.post(SYNC_URL, [{"json": page(cursor="c9", status={"type": "upToDate", "snapshotTs": 1})}])
+    requests_mock.post(SYNC_URL, [{"json": page(truncates=ALL_TRUNCATES, cursor="c9", status={"type": "upToDate", "snapshotTs": 1})}])
     _, _, states, _ = run(inline_config, catalog)
     assert {shared(s)["deployment_url"] for s in states} == {"https://murky-swan-635.convex.cloud"}
 
@@ -281,10 +298,8 @@ def test_read_resnapshots_streams_whose_state_was_cleared(requests_mock, inline_
 
 
 def test_read_skips_streams_missing_from_the_source(requests_mock, inline_config, catalog):
-    from unit_tests.helpers import POSTS_SCHEMA, configured_stream
-
     catalog.streams.append(configured_stream("", "comments", POSTS_SCHEMA))
-    requests_mock.post(SYNC_URL, [{"json": page(cursor="c1", status={"type": "upToDate", "snapshotTs": 1})}])
+    requests_mock.post(SYNC_URL, [{"json": page(truncates=ALL_TRUNCATES, cursor="c1", status={"type": "upToDate", "snapshotTs": 1})}])
     messages, _, states, _ = run(inline_config, catalog)
     assert "comments" not in requests_mock.request_history[0].json()["selection"][""]
     incomplete = [m.trace.stream_status for m in messages if m.type == Type.TRACE and m.trace.stream_status]
@@ -301,6 +316,7 @@ def test_read_restarts_on_expired_cursor(requests_mock, inline_config, catalog):
             {"status_code": 400, "json": {"code": "DataSyncCursorExpired", "message": "expired"}},
             {
                 "json": page(
+                    truncates=ALL_TRUNCATES,
                     values=[value("", "posts", {"_id": "p1", "_creationTime": 1.0, "author": "u", "body": "b"})],
                     cursor="n1",
                     sync_id="sync-2",
@@ -359,7 +375,7 @@ def test_read_checkpoints_every_n_pages(requests_mock, inline_config, catalog):
     inline_config["state_checkpoint_pages"] = 2
     requests_mock.post(
         SYNC_URL,
-        [{"json": page(cursor=f"c{i}")} for i in range(1, 6)]
+        [{"json": page(truncates=ALL_TRUNCATES if i == 1 else (), cursor=f"c{i}")} for i in range(1, 6)]
         + [{"json": page(cursor="done", status={"type": "upToDate", "snapshotTs": 1})}],
     )
     _, _, states, _ = run(inline_config, catalog)
@@ -374,7 +390,7 @@ def test_read_retries_on_server_errors(requests_mock, inline_config, catalog, mo
         [
             {"status_code": 503, "text": "unavailable"},
             {"status_code": 429, "text": "slow down", "headers": {"Retry-After": "0"}},
-            {"json": page(cursor="c1", status={"type": "upToDate", "snapshotTs": 1})},
+            {"json": page(truncates=ALL_TRUNCATES, cursor="c1", status={"type": "upToDate", "snapshotTs": 1})},
         ],
     )
     _, _, states, _ = run(inline_config, catalog)
@@ -407,6 +423,7 @@ def test_read_drops_tombstones_from_full_refresh_streams(requests_mock, inline_c
         [
             {
                 "json": page(
+                    truncates=ALL_TRUNCATES,
                     values=[
                         value("betterAuth", "user", {"_id": "u1", "_creationTime": 1.0, "email": "a@b.c"}, ts=10),
                         value("betterAuth", "user", {"_id": "u2"}, ts=20, deleted=True),
@@ -474,12 +491,11 @@ def test_read_resnapshots_streams_with_stale_state_without_warning(requests_mock
     assert "truncated table" not in caplog.text
 
 
-def test_read_treats_stream_whose_hint_disagrees_with_its_name_as_missing(requests_mock, inline_config, catalog):
-    from unit_tests.helpers import USER_SCHEMA, configured_stream
-
-    # The name still resolves to root/posts, but the catalog entry was discovered as betterAuth/user.
+def test_read_treats_stream_whose_namespace_disagrees_with_the_schema_as_missing(requests_mock, inline_config, catalog):
+    # The schema JSON knows root/posts, but the catalog entry claims the table lives in betterAuth.
     catalog.streams[0] = configured_stream("betterAuth", "posts", USER_SCHEMA)
-    requests_mock.post(SYNC_URL, [{"json": page(cursor="c1", status={"type": "upToDate", "snapshotTs": 1})}])
+    up_to_date = {"type": "upToDate", "snapshotTs": 1}
+    requests_mock.post(SYNC_URL, [{"json": page(truncates=[USER_TRUNCATE, RATE_LIMITS_TRUNCATE], cursor="c1", status=up_to_date)}])
     messages, _, states, _ = run(inline_config, catalog)
     assert "" not in requests_mock.request_history[0].json()["selection"]
     incomplete = [
@@ -489,6 +505,41 @@ def test_read_treats_stream_whose_hint_disagrees_with_its_name_as_missing(reques
     ]
     assert incomplete == ["posts"]
     assert "posts" not in last_states(states)
+
+
+def test_read_reports_a_table_missing_from_the_deployment_incomplete(requests_mock, inline_config, catalog, caplog):
+    # Convex only parses the selection; a table that does not exist never gets a truncate or a value.
+    requests_mock.post(
+        SYNC_URL,
+        [
+            {"json": page(truncates=[POSTS_TRUNCATE, USER_TRUNCATE], cursor="c1")},
+            {"json": page(cursor="c2", status={"type": "upToDate", "snapshotTs": 1})},
+        ],
+    )
+    with caplog.at_level(logging.WARNING):
+        messages, _, states, statuses = run(inline_config, catalog)
+    assert "resend/rateLimiter/rateLimits" in caplog.text and "do not exist" in caplog.text
+    incomplete = [
+        ident(m.trace.stream_status.stream_descriptor)
+        for m in messages
+        if m.type == Type.TRACE and m.trace.stream_status and m.trace.stream_status.status == AirbyteStreamStatus.INCOMPLETE
+    ]
+    assert incomplete == [RATE_LIMITS]
+    assert statuses.count(AirbyteStreamStatus.COMPLETE) == 2
+    # No state for the missing stream: the next run re-selects it and checks for its truncate again.
+    assert set(last_states(states)) == {POSTS, USER}
+    assert last_states(states)[POSTS]["snapshot_complete"] is True
+
+
+def test_read_accepts_cosmetic_changes_to_the_deployment_url(requests_mock, inline_config, catalog):
+    requests_mock.post(SYNC_URL, [{"json": page(truncates=ALL_TRUNCATES, cursor="c9", status={"type": "upToDate", "snapshotTs": 1})}])
+    _, _, states, _ = run(inline_config, catalog)
+    # Same host, different case, scheme and trailing slash: Convex would route this to the same deployment.
+    inline_config["deployment_url"] = "HTTP://Murky-Swan-635.convex.cloud/"
+    http_sync_url = "http://murky-swan-635.convex.cloud/api/v1/data/sync"
+    requests_mock.post(http_sync_url, json=page(cursor="c10", status={"type": "upToDate", "snapshotTs": 2}))
+    _, _, states, _ = run(inline_config, catalog, states)
+    assert shared(states[-1])["cursor"] == "c10"
 
 
 def test_read_does_not_retry_a_malformed_deployment_url(inline_config, catalog, monkeypatch):
@@ -509,7 +560,13 @@ def test_read_through_the_cdk_entrypoint(requests_mock, inline_config, catalog):
     requests_mock.post(
         SYNC_URL,
         [
-            {"json": page(values=[value("", "posts", {"_id": "p1", "_creationTime": 1.0, "author": "u1", "body": "hi"})], cursor="c1")},
+            {
+                "json": page(
+                    truncates=ALL_TRUNCATES,
+                    values=[value("", "posts", {"_id": "p1", "_creationTime": 1.0, "author": "u1", "body": "hi"})],
+                    cursor="c1",
+                )
+            },
             {"json": page(cursor="c2", status={"type": "upToDate", "snapshotTs": 1})},
         ],
     )

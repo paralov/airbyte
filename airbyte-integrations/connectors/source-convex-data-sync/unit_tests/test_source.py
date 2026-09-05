@@ -72,6 +72,9 @@ def test_parse_schema_json_rejects_bad_input(bad):
         ({"": {"x" * 65: None}}, "is not a valid Convex table name"),
         ({"better-auth": {"user": None}}, "'better-auth' is not a valid Convex component path"),
         ({"resend/": {"user": None}}, "'resend/' is not a valid Convex component path"),
+        # The identifier grammar allows it, but it is the reserved default key at every level of a selection.
+        ({"_other": {"user": None}}, "'_other' is reserved"),
+        ({"resend/_other": {"user": None}}, "'_other' is reserved"),
     ],
 )
 def test_parse_schema_json_rejects_names_convex_would_refuse(schema, needle):
@@ -130,6 +133,50 @@ def test_validator_to_json_schema_covers_every_validator_kind():
 def test_validator_to_json_schema_rejects_unknown_kind():
     with pytest.raises(AirbyteTracedException):
         validator_to_json_schema({"type": "tuple"})
+
+
+def test_validator_to_json_schema_decodes_int64_literals():
+    # ``v.literal(5n)`` serialises as base64 little-endian bytes, while the data sync export ships a plain number.
+    assert validator_to_json_schema({"type": "literal", "value": {"$integer": "BQAAAAAAAAA="}}) == {"type": "integer", "enum": [5]}
+    assert validator_to_json_schema({"type": "literal", "value": {"$integer": "//////////8="}}) == {"type": "integer", "enum": [-1]}
+
+
+@pytest.mark.parametrize(
+    "validator",
+    [
+        {"type": "object", "value": {"body": "string"}},
+        {"type": "object", "value": [{"a": 1}]},
+        {"type": "array", "value": "string"},
+        {"type": "union", "value": [1]},
+        {"type": "union", "value": []},
+        {"type": "union"},
+        {"type": "literal", "value": {"$bytes": "AA=="}},
+        {"type": "literal", "value": {"$integer": "not base64"}},
+        {"type": "literal", "value": {"$integer": "AA=="}},
+    ],
+)
+def test_validator_to_json_schema_rejects_malformed_nested_validators_as_config_errors(validator):
+    with pytest.raises(AirbyteTracedException) as err:
+        validator_to_json_schema(validator)
+    assert err.value.failure_type.value == "config_error"
+    assert "Invalid Convex validator" in err.value.message
+
+
+def test_check_reports_a_malformed_validator_as_a_failed_status(inline_config):
+    # A raw AttributeError here would leave the entrypoint with a stack trace instead of a CONNECTION_STATUS message.
+    inline_config["schema_json"] = json.dumps({"": {"posts": {"type": "object", "value": {"body": "string"}}}})
+    status = SourceConvexDataSync().check(logger, inline_config)
+    assert status.status == Status.FAILED
+    assert "Invalid Convex validator" in status.message
+
+
+def test_check_connection_falls_back_to_backoff_on_a_non_finite_retry_after(requests_mock, inline_config, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("source_convex_data_sync.source.time.sleep", sleeps.append)
+    requests_mock.get(ACTIVE_SYNCS_URL, status_code=503, text="down", headers={"Retry-After": "nan"})
+    ok, error = SourceConvexDataSync().check_connection(logger, inline_config)
+    assert not ok and "503" in error
+    assert sleeps == [2]
 
 
 def test_check_connection_ok(requests_mock, inline_config):
