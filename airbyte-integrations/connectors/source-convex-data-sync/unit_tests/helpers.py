@@ -56,14 +56,12 @@ def inline_config():
     return {"deployment_url": DEPLOYMENT_URL, "access_key": "test_api_key", "schema_json": json.dumps(SCHEMA)}
 
 
-def configured_stream(name, component, table, schema, sync_mode=SyncMode.incremental):
-    json_schema = dict(schema)
-    json_schema["x-convex-component"] = component
-    json_schema["x-convex-table"] = table
+def configured_stream(component, table, schema, sync_mode=SyncMode.incremental):
     return ConfiguredAirbyteStream(
         stream=AirbyteStream(
-            name=name,
-            json_schema=json_schema,
+            name=table,
+            namespace=component or None,
+            json_schema=dict(schema),
             supported_sync_modes=[SyncMode.full_refresh, SyncMode.incremental],
             source_defined_cursor=True,
             default_cursor_field=["_ts"],
@@ -80,9 +78,9 @@ def configured_stream(name, component, table, schema, sync_mode=SyncMode.increme
 def catalog():
     return ConfiguredAirbyteCatalog(
         streams=[
-            configured_stream("posts", "", "posts", POSTS_SCHEMA),
-            configured_stream("betterAuth__user", "betterAuth", "user", USER_SCHEMA),
-            configured_stream("resend__rateLimiter__rateLimits", "resend/rateLimiter", "rateLimits", RATE_LIMITS_SCHEMA),
+            configured_stream("", "posts", POSTS_SCHEMA),
+            configured_stream("betterAuth", "user", USER_SCHEMA),
+            configured_stream("resend/rateLimiter", "rateLimits", RATE_LIMITS_SCHEMA),
         ]
     )
 
@@ -99,3 +97,15 @@ def page(values=(), truncates=(), status=None, cursor="c1", has_more=True, sync_
 
 def value(component, table, doc, ts=1_788_466_011_116_811_508, deleted=False):
     return {"component": component, "table": table, "ts": ts, "deleted": deleted, "value": doc}
+
+
+POSTS = (None, "posts")
+USER = ("betterAuth", "user")
+RATE_LIMITS = ("resend/rateLimiter", "rateLimits")
+
+
+def ident(record_or_descriptor):
+    """(namespace, name) of a record, stream descriptor, or stream."""
+    obj = record_or_descriptor
+    name = getattr(obj, "stream", None) if isinstance(getattr(obj, "stream", None), str) else getattr(obj, "name", None)
+    return (obj.namespace, name)

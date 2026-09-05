@@ -8,9 +8,9 @@ One Convex data sync (``POST /api/v1/data/sync``) streams every selected table
 in the deployment, including tables that live inside installed components, and
 returns a single opaque cursor per page. That maps onto Airbyte as:
 
-* one Airbyte stream per ``(component, table)`` pair, named ``table`` for the
-  root component and ``<component path>__<table>`` (``/`` becomes ``__``) for
-  component tables;
+* one Airbyte stream per ``(component, table)`` pair: the stream is named after
+  the table and its namespace is the component path (root tables use the
+  destination's default namespace);
 * per-stream Airbyte state that each carry the same Convex cursor (the CDK
   entrypoint's record counting requires per-stream state), plus a little
   per-stream bookkeeping;
@@ -36,6 +36,7 @@ import requests
 from airbyte_cdk.models import (
     AirbyteConnectionStatus,
     AirbyteMessage,
+    AirbyteRecordMessage,
     AirbyteStateBlob,
     AirbyteStateMessage,
     AirbyteStateType,
@@ -50,7 +51,6 @@ from airbyte_cdk.models import (
 )
 from airbyte_cdk.sources import AbstractSource
 from airbyte_cdk.sources.streams import Stream
-from airbyte_cdk.sources.utils.record_helper import stream_data_to_airbyte_message
 from airbyte_cdk.utils.stream_status_utils import as_airbyte_message as stream_status_message
 from airbyte_cdk.utils.traced_exception import AirbyteTracedException, FailureType
 
@@ -63,7 +63,6 @@ CONVEX_CLIENT_VERSION = "0.1.0"
 CONVEX_CLIENT_HEADER = f"airbyte-export-{CONVEX_CLIENT_VERSION}"
 
 ROOT_COMPONENT = ""
-COMPONENT_SEPARATOR = "__"
 
 # Convex table and component names are identifiers of at most 64 characters; user tables never start with ``_``.
 CONVEX_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
@@ -115,16 +114,16 @@ SYSTEM_FIELD_SCHEMAS: Dict[str, Dict[str, Any]] = {
 # ---------------------------------------------------------------------------
 
 
-def stream_name_for(component: str, table: str) -> str:
-    """``users`` for root tables, ``betterAuth__user`` / ``resend__emailWorkpool__payload`` for component tables.
+StreamKey = Tuple[str, str]  # (component path, table); the root component is ""
 
-    Convex identifiers may themselves contain ``__``, so this mapping is not injective;
-    ``SourceConvexDataSync._stream_pairs`` rejects schemas where two tables collide, and ``read`` never parses
-    names back.
-    """
-    if component == ROOT_COMPONENT:
-        return table
-    return f"{component.replace('/', COMPONENT_SEPARATOR)}{COMPONENT_SEPARATOR}{table}"
+
+def namespace_for(component: str) -> Optional[str]:
+    """Airbyte namespace of a table: the component path, or the destination default for the root component."""
+    return component or None
+
+
+def stream_key(name: str, namespace: Optional[str]) -> StreamKey:
+    return (namespace or ROOT_COMPONENT, name)
 
 
 # ---------------------------------------------------------------------------
@@ -375,13 +374,6 @@ def airbyte_schema_for(validator: Optional[Mapping[str, Any]]) -> Dict[str, Any]
     return schema
 
 
-def with_convex_origin(schema: Dict[str, Any], component: str, table: str) -> Dict[str, Any]:
-    """Record the (component, table) origin in the stream schema so read() never has to parse stream names."""
-    schema["x-convex-component"] = component
-    schema["x-convex-table"] = table
-    return schema
-
-
 # ---------------------------------------------------------------------------
 # Streams
 # ---------------------------------------------------------------------------
@@ -394,11 +386,15 @@ class ConvexTableStream(Stream):
     def __init__(self, component: str, table: str, validator: Optional[Mapping[str, Any]]):
         self.component = component
         self.table = table
-        self._json_schema = with_convex_origin(airbyte_schema_for(validator), component, table)
+        self._json_schema = airbyte_schema_for(validator)
 
     @property
     def name(self) -> str:
-        return stream_name_for(self.component, self.table)
+        return self.table
+
+    @property
+    def namespace(self) -> Optional[str]:
+        return namespace_for(self.component)
 
     def get_json_schema(self) -> Mapping[str, Any]:
         return self._json_schema
@@ -443,7 +439,7 @@ class SyncState:
         self.sync_id: Optional[str] = None
         self.deployment_url: Optional[str] = None
         self.checkpoint_seq = 0
-        self.streams: Dict[str, Dict[str, Any]] = {}
+        self.streams: Dict[StreamKey, Dict[str, Any]] = {}
 
     @classmethod
     def _stream_keys(cls, blob: Mapping[str, Any]) -> Dict[str, Any]:
@@ -454,12 +450,13 @@ class SyncState:
         out = cls()
         if not state:
             return out
-        blobs: Dict[str, Dict[str, Any]] = {}
+        blobs: Dict[StreamKey, Dict[str, Any]] = {}
         for message in state:
             if message.type == AirbyteStateType.STREAM and message.stream is not None:
                 blob = _blob_to_dict(message.stream.stream_state)
                 if "cursor" in blob:
-                    blobs[message.stream.stream_descriptor.name] = blob
+                    descriptor = message.stream.stream_descriptor
+                    blobs[stream_key(descriptor.name, descriptor.namespace)] = blob
         if not blobs:
             logger.warning("No resumable Convex cursor in the incoming state; starting a fresh data sync.")
             return out
@@ -469,7 +466,7 @@ class SyncState:
         out.deployment_url = latest.get("deployment_url")
         out.checkpoint_seq = int(latest.get("checkpointed_at") or 0)
         out.streams = {
-            name: cls._stream_keys(blob) for name, blob in blobs.items() if blob.get("checkpointed_at") == latest.get("checkpointed_at")
+            key: cls._stream_keys(blob) for key, blob in blobs.items() if blob.get("checkpointed_at") == latest.get("checkpointed_at")
         }
         return out
 
@@ -479,27 +476,29 @@ class SyncState:
         self.sync_id = None
         self.streams = {}
 
-    def stream(self, name: str) -> Dict[str, Any]:
-        return self.streams.setdefault(name, {})
+    def stream(self, key: StreamKey) -> Dict[str, Any]:
+        return self.streams.setdefault(key, {})
 
-    def snapshot_complete(self, name: str) -> bool:
-        return self.streams.get(name, {}).get("snapshot_complete") is True
+    def snapshot_complete(self, key: StreamKey) -> bool:
+        return self.streams.get(key, {}).get("snapshot_complete") is True
 
-    def to_messages(self, stream_names: Iterable[str]) -> Iterator[AirbyteMessage]:
+    def to_messages(self, keys: Iterable[StreamKey]) -> Iterator[AirbyteMessage]:
         self.checkpoint_seq += 1
-        for name in stream_names:
+        for component, table in keys:
             blob = AirbyteStateBlob(
                 cursor=self.cursor,
                 sync_id=self.sync_id,
                 deployment_url=self.deployment_url,
                 checkpointed_at=self.checkpoint_seq,
-                **self.streams.get(name, {}),
+                **self.streams.get((component, table), {}),
             )
             yield AirbyteMessage(
                 type=Type.STATE,
                 state=AirbyteStateMessage(
                     type=AirbyteStateType.STREAM,
-                    stream=AirbyteStreamState(stream_descriptor=StreamDescriptor(name=name), stream_state=blob),
+                    stream=AirbyteStreamState(
+                        stream_descriptor=StreamDescriptor(name=table, namespace=namespace_for(component)), stream_state=blob
+                    ),
                 ),
             )
 
@@ -507,6 +506,10 @@ class SyncState:
 # ---------------------------------------------------------------------------
 # Source
 # ---------------------------------------------------------------------------
+
+
+def _describe(key: StreamKey) -> str:
+    return f"{key[0] or '<root>'}/{key[1]}"
 
 
 def build_selection(pairs: Iterable[Tuple[str, str]]) -> Dict[str, Any]:
@@ -565,23 +568,6 @@ class SourceConvexDataSync(AbstractSource):
     def _table_schemas(config: Mapping[str, Any]) -> TableSchemas:
         return parse_schema_json(config.get("schema_json") or "")
 
-    @staticmethod
-    def _stream_pairs(schemas: TableSchemas) -> Dict[str, Tuple[str, str]]:
-        """Airbyte stream name -> ``(component, table)`` for every table in the schema JSON, rejecting name collisions."""
-        pairs: Dict[str, Tuple[str, str]] = {}
-        for component, table in sorted(schemas):
-            name = stream_name_for(component, table)
-            other = pairs.setdefault(name, (component, table))
-            if other != (component, table):
-                raise AirbyteTracedException(
-                    message=(
-                        f"Tables {other[0] or '<root>'}/{other[1]} and {component or '<root>'}/{table} "
-                        f"both map to the Airbyte stream name {name!r}. Rename one of them or drop it from the schema JSON."
-                    ),
-                    failure_type=FailureType.config_error,
-                )
-        return pairs
-
     # -- check / discover -------------------------------------------------
 
     def check(self, logger: logging.Logger, config: Mapping[str, Any]) -> AirbyteConnectionStatus:
@@ -609,8 +595,7 @@ class SourceConvexDataSync(AbstractSource):
 
     def _streams(self, config: Mapping[str, Any]) -> List[ConvexTableStream]:
         schemas = self._table_schemas(config)
-        pairs = self._stream_pairs(schemas).values()
-        return [ConvexTableStream(component, table, schemas[(component, table)]) for component, table in pairs]
+        return [ConvexTableStream(component, table, schemas[(component, table)]) for component, table in sorted(schemas)]
 
     # -- read -------------------------------------------------------------
 
@@ -638,27 +623,24 @@ class SourceConvexDataSync(AbstractSource):
         max_pages = int(config.get("max_pages_per_sync") or 0)
         checkpoint_pages = int(config.get("state_checkpoint_pages") or STATE_CHECKPOINT_PAGES)
 
-        # Resolve every configured stream to its (component, table) against the schema JSON.
-        known = self._stream_pairs(self._table_schemas(config))
-        pair_to_name: Dict[Tuple[str, str], str] = {}
-        selected: Dict[str, ConfiguredAirbyteStream] = {}
+        # Every configured stream is a (component, table) pair: namespace + name. Keep the ones the schema JSON knows.
+        known = set(self._table_schemas(config))
+        selected: Dict[StreamKey, ConfiguredAirbyteStream] = {}
         for cs in catalog.streams:
-            name = cs.stream.name
-            pair = self._pair_for(cs, known)
-            if pair is None:
+            key = stream_key(cs.stream.name, cs.stream.namespace)
+            if key not in known:
                 logger.warning(
-                    "The stream %r in your connection configuration was not found in the source; it is reported incomplete until "
+                    "The stream %s in your connection configuration was not found in the source; it is reported incomplete until "
                     "you refresh the source schema in your connection or add the table back to the Table Schemas field.",
-                    name,
+                    _describe(key),
                 )
                 yield stream_status_message(cs.stream, AirbyteStreamStatus.INCOMPLETE)
                 continue
-            pair_to_name[pair] = name
-            selected[name] = cs
+            selected[key] = cs
         if not selected:
             return
 
-        full_selection = build_selection(pair_to_name.keys())
+        full_selection = build_selection(selected)
         resuming = sync_state.cursor is not None
 
         for cs in selected.values():
@@ -680,11 +662,10 @@ class SourceConvexDataSync(AbstractSource):
                 or (name in full_refresh and sync_state.streams[name].get("snapshot_complete") is not False)
             }
             if resnapshot:
-                keep = [pair for pair, name in pair_to_name.items() if name not in resnapshot]
-                priming_selection = build_selection(keep)
+                priming_selection = build_selection(key for key in selected if key not in resnapshot)
                 for name in resnapshot:
                     sync_state.stream(name)["snapshot_complete"] = False
-                logger.info("Asking Convex to re-sync %s from scratch.", sorted(resnapshot))
+                logger.info("Asking Convex to re-sync %s from scratch.", [_describe(key) for key in sorted(resnapshot)])
         for name in selected:
             sync_state.stream(name).setdefault("snapshot_complete", False)
 
@@ -696,7 +677,7 @@ class SourceConvexDataSync(AbstractSource):
                 "max_pages_per_sync=%d is not applied while the full refresh streams %s are selected: their snapshot has to "
                 "finish within one run.",
                 max_pages,
-                sorted(full_refresh),
+                [_describe(key) for key in sorted(full_refresh)],
             )
             max_pages = 0
 
@@ -706,8 +687,8 @@ class SourceConvexDataSync(AbstractSource):
             for cs in selected.values():
                 yield stream_status_message(cs.stream, status)
 
-        running_emitted: Set[str] = set()
-        dropped: Dict[Tuple[str, str], int] = {}
+        running_emitted: Set[StreamKey] = set()
+        dropped: Dict[StreamKey, int] = {}
         pages = 0
         records = 0
         restarted = False
@@ -748,9 +729,8 @@ class SourceConvexDataSync(AbstractSource):
                 sync_state.sync_id = page.get("syncId", sync_state.sync_id)
 
                 for truncate in page.get("truncates", []):
-                    pair = (truncate.get("component", ROOT_COMPONENT), truncate["table"])
-                    name = pair_to_name.get(pair)
-                    if name is None:
+                    name = (truncate.get("component", ROOT_COMPONENT), truncate["table"])
+                    if name not in selected:
                         continue
                     if sync_state.snapshot_complete(name):
                         # Truncates during the initial snapshot are normal; after it they mean the table was replaced.
@@ -758,15 +738,14 @@ class SourceConvexDataSync(AbstractSource):
                             "Convex truncated table %s (component %r); it will be re-sent in full. Rows deleted before the truncate "
                             "are not tombstoned, so reset this stream in the destination if you need an exact mirror.",
                             truncate["table"],
-                            pair[0],
+                            name[0],
                         )
                     sync_state.stream(name)["snapshot_complete"] = False
 
                 for value in page.get("values", []):
-                    pair = (value.get("component", ROOT_COMPONENT), value["table"])
-                    name = pair_to_name.get(pair)
-                    if name is None:
-                        dropped[pair] = dropped.get(pair, 0) + 1
+                    name = (value.get("component", ROOT_COMPONENT), value["table"])
+                    if name not in selected:
+                        dropped[name] = dropped.get(name, 0) + 1
                         continue
                     if name in full_refresh and value.get("deleted"):
                         # A full refresh mirrors the live documents; a tombstone would land as a row of nulls.
@@ -775,7 +754,15 @@ class SourceConvexDataSync(AbstractSource):
                         running_emitted.add(name)
                         yield stream_status_message(selected[name].stream, AirbyteStreamStatus.RUNNING)
                     records += 1
-                    yield stream_data_to_airbyte_message(name, _record_from_value(value))
+                    yield AirbyteMessage(
+                        type=Type.RECORD,
+                        record=AirbyteRecordMessage(
+                            stream=name[1],
+                            namespace=namespace_for(name[0]),
+                            data=_record_from_value(value),
+                            emitted_at=int(time.time() * 1000),
+                        ),
+                    )
 
                 sync_state.cursor = next_cursor
                 status_type = page.get("status", {}).get("type")
@@ -814,18 +801,3 @@ class SourceConvexDataSync(AbstractSource):
                 ", ".join(f"{c or '<root>'}/{t}={n}" for (c, t), n in sorted(dropped.items())),
             )
         logger.info("Convex data sync %s: %d pages, %d records, status=%s", sync_state.sync_id, pages, records, status_type or "none")
-
-    @staticmethod
-    def _pair_for(configured_stream: ConfiguredAirbyteStream, known: Mapping[str, Tuple[str, str]]) -> Optional[Tuple[str, str]]:
-        """``(component, table)`` of the discovered stream with this name, or None when the deployment no longer has it.
-
-        The schema's origin hint (written by discover) must agree: if a different table now maps to this stream name,
-        the configured stream is treated as missing rather than silently bound to the new table.
-        """
-        pair = known.get(configured_stream.stream.name)
-        schema = configured_stream.stream.json_schema or {}
-        if pair is not None and "x-convex-table" in schema:
-            hint = (schema.get("x-convex-component", ROOT_COMPONENT), schema["x-convex-table"])
-            if hint != pair:
-                return None
-        return pair

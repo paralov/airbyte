@@ -15,6 +15,8 @@ The connector uses the [Convex Deployment API](https://docs.convex.dev/deploymen
    component path and table), a `status`, and an opaque `nextCursor`. One cursor covers all tables.
 2. `GET /api/v1/data/list_active_syncs` is used as the connection check.
 
+Each table is one Airbyte stream named after the table, with the component path as its namespace.
+
 Table schemas are not fetched from the deployment. Convex schemas are opt-in, so the user supplies the
 tables to sync and their validators (Convex validator JSON) in the connector configuration, and the
 connector converts them to JSON Schema.

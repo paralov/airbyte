@@ -10,7 +10,6 @@ from source_convex_data_sync.source import (
     SourceConvexDataSync,
     build_selection,
     parse_schema_json,
-    stream_name_for,
     validator_to_json_schema,
 )
 
@@ -22,10 +21,9 @@ from unit_tests.helpers import ACTIVE_SYNCS_URL, POSTS_VALIDATOR, SCHEMA, USER_V
 logger = logging.getLogger("airbyte")
 
 
-def test_stream_names():
-    assert stream_name_for("", "posts") == "posts"
-    assert stream_name_for("betterAuth", "user") == "betterAuth__user"
-    assert stream_name_for("resend/emailWorkpool", "payload") == "resend__emailWorkpool__payload"
+def test_streams_are_named_by_table_with_component_namespace(inline_config):
+    streams = SourceConvexDataSync().streams(inline_config)
+    assert [(s.namespace, s.name) for s in streams] == [(None, "posts"), ("betterAuth", "user"), ("resend/rateLimiter", "rateLimits")]
 
 
 def test_build_selection_includes_only_requested_tables():
@@ -188,15 +186,12 @@ def test_check_connection_reports_non_json_success_body(requests_mock, inline_co
 
 def test_streams_from_inline_schema(inline_config):
     streams = SourceConvexDataSync().streams(inline_config)
-    by_name = {s.name: s for s in streams}
-    assert set(by_name) == {"posts", "betterAuth__user", "resend__rateLimiter__rateLimits"}
-    user = by_name["betterAuth__user"]
+    by_key = {(s.namespace, s.name): s for s in streams}
+    user = by_key[("betterAuth", "user")]
     assert user.primary_key == "_id"
     assert user.cursor_field == "_ts"
     assert user.supports_incremental and user.source_defined_cursor
     schema = user.get_json_schema()
-    assert schema["x-convex-component"] == "betterAuth"
-    assert schema["x-convex-table"] == "user"
     assert schema["additionalProperties"] is True
     for field in ("_ts", "_deleted", "_component", "_table", "_ab_cdc_lsn", "_ab_cdc_updated_at", "_ab_cdc_deleted_at"):
         assert field in schema["properties"]
@@ -227,23 +222,16 @@ def test_streams_schemaless_table_is_permissive():
     }
 
 
-COLLIDING_CONFIG = {
-    "deployment_url": "https://murky-swan-635.convex.cloud",
-    "access_key": "k",
-    "schema_json": json.dumps({"": {"audit__log": POSTS_VALIDATOR}, "audit": {"log": USER_VALIDATOR}}),
-}
-
-
-def test_streams_rejects_colliding_stream_names():
-    with pytest.raises(AirbyteTracedException) as err:
-        SourceConvexDataSync().streams(COLLIDING_CONFIG)
-    assert "audit__log" in err.value.message
-
-
-def test_check_connection_reports_colliding_stream_names(requests_mock):
-    requests_mock.get(ACTIVE_SYNCS_URL, json={"syncs": [], "pagination": {"hasMore": False}})
-    ok, error = SourceConvexDataSync().check_connection(logger, COLLIDING_CONFIG)
-    assert not ok and "audit__log" in error
+def test_same_table_name_in_two_components_yields_two_streams():
+    config = {
+        "deployment_url": "https://murky-swan-635.convex.cloud",
+        "access_key": "k",
+        "schema_json": json.dumps({"rateLimiter": {"rateLimits": POSTS_VALIDATOR}, "resend/rateLimiter": {"rateLimits": USER_VALIDATOR}}),
+    }
+    streams = SourceConvexDataSync().streams(config)
+    assert [(s.namespace, s.name) for s in streams] == [("rateLimiter", "rateLimits"), ("resend/rateLimiter", "rateLimits")]
+    catalog = SourceConvexDataSync().discover(logger, config)
+    assert [(s.namespace, s.name) for s in catalog.streams] == [("rateLimiter", "rateLimits"), ("resend/rateLimiter", "rateLimits")]
 
 
 def test_check_connection_rejects_malformed_deployment_url(inline_config):

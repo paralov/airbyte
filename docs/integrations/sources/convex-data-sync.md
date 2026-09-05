@@ -15,11 +15,19 @@ installed [Convex components](https://docs.convex.dev/components) as well as tab
 
 ### Output schema
 
-Every Convex table becomes one Airbyte stream:
+Every Convex table becomes one Airbyte stream named after the table. Tables inside a
+[component](https://docs.convex.dev/components) carry the component path as the stream's namespace, for
+example namespace `betterAuth` for `user`, or `resend/emailWorkpool` for `payload`. Tables in the root of
+the app have no namespace and land in the destination's default namespace.
 
-- Tables in the root of the app keep their name, for example `messages`.
-- Tables inside a component are named `<component path>__<table>`, with `/` in nested component
-  paths replaced by `__`. For example `betterAuth__user` or `resend__emailWorkpool__payload`.
+Where component tables end up is controlled by the connection's namespace setting:
+
+- **Destination default** ignores namespaces. Only use this if no table name repeats across components.
+- **Mirror source structure** puts each component in its own database or schema, named after the path.
+- **Custom format** such as `convex_${SOURCE_NAMESPACE}` keeps everything side by side, e.g. `convex_betterAuth`.
+
+Joins across components work as usual with qualified names, e.g. `convex.agentRun` with
+`convex_betterAuth.user`.
 
 Every record includes the fields defined for the table plus these system fields:
 
@@ -97,7 +105,7 @@ one. Consequences:
 | Replicate Incremental Deletes | Yes        |
 | Change Data Capture           | Yes        |
 | Component tables              | Yes        |
-| Namespaces                    | No         |
+| Namespaces                    | Yes        |
 
 ### Performance considerations
 
@@ -131,6 +139,6 @@ Only "Production" deployments should be synced.
 
 | Version | Date       | Pull Request                                             | Subject                                                          |
 | :------ | :--------- | :------------------------------------------------------- | :--------------------------------------------------------------- |
-| 0.1.0 | 2026-09-04 | [1](https://github.com/paralov/airbyte/pull/1) | New connector on the Convex Deployment API data sync endpoint: one resumable cursor, component tables as streams, schemas supplied as Convex validator JSON |
+| 0.1.0 | 2026-09-04 | [1](https://github.com/paralov/airbyte/pull/1) | New connector on the Convex Deployment API data sync endpoint: one resumable cursor, component tables as namespaced streams, schemas supplied as Convex validator JSON |
 
 </details>

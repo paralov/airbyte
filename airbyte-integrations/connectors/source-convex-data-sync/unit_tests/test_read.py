@@ -18,7 +18,7 @@ from airbyte_cdk.models import (
     Type,
 )
 from airbyte_cdk.utils.traced_exception import AirbyteTracedException, FailureType
-from unit_tests.helpers import SYNC_URL, page, value
+from unit_tests.helpers import POSTS, RATE_LIMITS, SYNC_URL, USER, configured_stream, ident, page, value
 
 
 logger = logging.getLogger("airbyte")
@@ -32,18 +32,19 @@ def run(config, catalog, state=None):
     return messages, records, states, statuses
 
 
-def stream_state(name, cursor, sync_id="sync-1", checkpointed_at=1, **extra):
+def stream_state(key, cursor, sync_id="sync-1", checkpointed_at=1, **extra):
+    namespace, name = key
     return AirbyteStateMessage(
         type=AirbyteStateType.STREAM,
         stream=AirbyteStreamState(
-            stream_descriptor=StreamDescriptor(name=name),
+            stream_descriptor=StreamDescriptor(name=name, namespace=namespace),
             stream_state=AirbyteStateBlob(cursor=cursor, sync_id=sync_id, checkpointed_at=checkpointed_at, **extra),
         ),
     )
 
 
 def global_state(cursor, sync_id="sync-1"):
-    return [stream_state(name, cursor, sync_id) for name in ("posts", "betterAuth__user", "resend__rateLimiter__rateLimits")]
+    return [stream_state(name, cursor, sync_id) for name in (POSTS, USER, RATE_LIMITS)]
 
 
 def shared(state):
@@ -54,7 +55,7 @@ def last_states(states):
     """The final checkpoint: one state message per stream, keyed by stream name."""
     out = {}
     for s in states:
-        out[s.stream.stream_descriptor.name] = dict(vars(s.stream.stream_state))
+        out[ident(s.stream.stream_descriptor)] = dict(vars(s.stream.stream_state))
     return out
 
 
@@ -92,7 +93,7 @@ def test_read_routes_records_by_component(requests_mock, inline_config, catalog)
 
     messages, records, states, statuses = run(inline_config, catalog)
 
-    assert [r.stream for r in records] == ["posts", "betterAuth__user", "resend__rateLimiter__rateLimits", "betterAuth__user"]
+    assert [ident(r) for r in records] == [POSTS, USER, RATE_LIMITS, USER]
     post = records[0].data
     assert post["_id"] == "p1" and post["body"] == "hi"
     assert post["_ts"] == 10_000_000_000 and post["_ab_cdc_lsn"] == 10_000_000_000
@@ -129,10 +130,10 @@ def test_read_routes_records_by_component(requests_mock, inline_config, catalog)
     # Final checkpoint: every stream carries the same last cursor.
     assert all(s.type == AirbyteStateType.STREAM for s in states)
     stream_states = last_states(states)
-    assert set(stream_states) == {"posts", "betterAuth__user", "resend__rateLimiter__rateLimits"}
+    assert set(stream_states) == {POSTS, USER, RATE_LIMITS}
     assert {s["cursor"] for s in stream_states.values()} == {"c3"}
     assert {s["sync_id"] for s in stream_states.values()} == {"sync-1"}
-    assert stream_states["betterAuth__user"]["snapshot_complete"] is True
+    assert stream_states[USER]["snapshot_complete"] is True
 
     # Stream status lifecycle.
     assert statuses.count(AirbyteStreamStatus.STARTED) == 3
@@ -149,7 +150,7 @@ def test_read_resumes_from_global_state(requests_mock, inline_config, catalog):
 
 
 def test_read_full_refresh_stream_is_reselected(requests_mock, inline_config, catalog):
-    catalog.streams[1].sync_mode = SyncMode.full_refresh  # betterAuth__user
+    catalog.streams[1].sync_mode = SyncMode.full_refresh  # betterAuth/user
     requests_mock.post(
         SYNC_URL,
         [
@@ -165,7 +166,7 @@ def test_read_full_refresh_stream_is_reselected(requests_mock, inline_config, ca
 
 
 def test_read_full_refresh_is_reselected_even_when_priming_page_is_up_to_date(requests_mock, inline_config, catalog, caplog):
-    catalog.streams[1].sync_mode = SyncMode.full_refresh  # betterAuth__user
+    catalog.streams[1].sync_mode = SyncMode.full_refresh  # betterAuth/user
     requests_mock.post(
         SYNC_URL,
         [
@@ -185,8 +186,8 @@ def test_read_full_refresh_is_reselected_even_when_priming_page_is_up_to_date(re
     assert len(requests_mock.request_history) == 2
     assert "betterAuth" not in requests_mock.request_history[0].json()["selection"]
     assert "betterAuth" in requests_mock.request_history[1].json()["selection"]
-    assert [r.stream for r in records] == ["betterAuth__user"]
-    assert last_states(states)["betterAuth__user"]["snapshot_complete"] is True
+    assert [ident(r) for r in records] == [USER]
+    assert last_states(states)[USER]["snapshot_complete"] is True
     # The truncate that starts the re-sync is expected, not a post-snapshot table replacement.
     assert "truncated table" not in caplog.text
 
@@ -203,8 +204,8 @@ def test_read_all_full_refresh_still_fetches_full_selection(requests_mock, inlin
 def test_read_max_pages_does_not_stop_on_priming_page(requests_mock, inline_config, catalog):
     inline_config["max_pages_per_sync"] = 1
     requests_mock.post(SYNC_URL, [{"json": page(cursor="c2")}, {"json": page(cursor="c3")}])
-    # resend__rateLimiter__rateLimits has no state, so it is re-synced via a priming page first.
-    run(inline_config, catalog, [stream_state("posts", "c1"), stream_state("betterAuth__user", "c1")])
+    # resend/rateLimiter/rateLimits has no state, so it is re-synced via a priming page first.
+    run(inline_config, catalog, [stream_state(POSTS, "c1"), stream_state(USER, "c1")])
     assert len(requests_mock.request_history) == 2
 
 
@@ -225,13 +226,13 @@ def test_read_ignores_max_pages_while_a_full_refresh_snapshot_is_in_progress(req
     # The platform clears full refresh state between jobs, so a snapshot cut short by the page cap would start over
     # on every run; the run continues until the sync is up to date instead.
     assert len(requests_mock.request_history) == 4
-    assert last_states(states)["posts"]["snapshot_complete"] is True
+    assert last_states(states)[POSTS]["snapshot_complete"] is True
     assert statuses.count(AirbyteStreamStatus.COMPLETE) == 3 and AirbyteStreamStatus.INCOMPLETE not in statuses
     assert "max_pages_per_sync=1 is not applied" in caplog.text
 
 
 def test_read_does_not_checkpoint_when_the_priming_page_fails(requests_mock, inline_config, catalog):
-    catalog.streams[1].sync_mode = SyncMode.full_refresh  # betterAuth__user
+    catalog.streams[1].sync_mode = SyncMode.full_refresh  # betterAuth/user
     requests_mock.post(SYNC_URL, [{"status_code": 403, "json": {"code": "Forbidden", "message": "missing deployment:data:view"}}])
     emitted = []
     with pytest.raises(AirbyteTracedException):
@@ -272,7 +273,7 @@ def test_read_rejects_a_page_without_a_next_cursor(requests_mock, inline_config,
 def test_read_resnapshots_streams_whose_state_was_cleared(requests_mock, inline_config, catalog):
     # The platform's per-stream "Clear data" passes state for the other streams only.
     requests_mock.post(SYNC_URL, [{"json": page(cursor="c9", status={"type": "upToDate", "snapshotTs": 1})}])
-    run(inline_config, catalog, [stream_state("posts", "c8"), stream_state("betterAuth__user", "c8")])
+    run(inline_config, catalog, [stream_state(POSTS, "c8"), stream_state(USER, "c8")])
     first, second = requests_mock.request_history[0].json(), requests_mock.request_history[1].json()
     assert first["cursor"] == "c8"
     assert "resend/rateLimiter" not in first["selection"]
@@ -282,7 +283,7 @@ def test_read_resnapshots_streams_whose_state_was_cleared(requests_mock, inline_
 def test_read_skips_streams_missing_from_the_source(requests_mock, inline_config, catalog):
     from unit_tests.helpers import POSTS_SCHEMA, configured_stream
 
-    catalog.streams.append(configured_stream("comments", "", "comments", POSTS_SCHEMA))
+    catalog.streams.append(configured_stream("", "comments", POSTS_SCHEMA))
     requests_mock.post(SYNC_URL, [{"json": page(cursor="c1", status={"type": "upToDate", "snapshotTs": 1})}])
     messages, _, states, _ = run(inline_config, catalog)
     assert "comments" not in requests_mock.request_history[0].json()["selection"][""]
@@ -384,9 +385,9 @@ def test_read_retries_on_server_errors(requests_mock, inline_config, catalog, mo
 def test_read_resumes_from_most_recent_checkpoint(requests_mock, inline_config, catalog):
     requests_mock.post(SYNC_URL, [{"json": page(cursor="c9", status={"type": "upToDate", "snapshotTs": 1})}])
     state = [
-        stream_state("posts", "old", checkpointed_at=1),
-        stream_state("betterAuth__user", "newer", checkpointed_at=2),
-        stream_state("resend__rateLimiter__rateLimits", "old", checkpointed_at=1),
+        stream_state(POSTS, "old", checkpointed_at=1),
+        stream_state(USER, "newer", checkpointed_at=2),
+        stream_state(RATE_LIMITS, "old", checkpointed_at=1),
     ]
     run(inline_config, catalog, state)
     assert requests_mock.request_history[0].json()["cursor"] == "newer"
@@ -400,7 +401,7 @@ def test_read_with_empty_catalog_makes_no_requests(requests_mock, inline_config,
 
 
 def test_read_drops_tombstones_from_full_refresh_streams(requests_mock, inline_config, catalog):
-    catalog.streams[1].sync_mode = SyncMode.full_refresh  # betterAuth__user
+    catalog.streams[1].sync_mode = SyncMode.full_refresh  # betterAuth/user
     requests_mock.post(
         SYNC_URL,
         [
@@ -418,22 +419,19 @@ def test_read_drops_tombstones_from_full_refresh_streams(requests_mock, inline_c
         ],
     )
     _, records, _, statuses = run(inline_config, catalog)
-    assert [(r.stream, r.data["_id"], r.data["_deleted"]) for r in records] == [("betterAuth__user", "u1", False), ("posts", "p1", True)]
+    assert [(ident(r), r.data["_id"], r.data["_deleted"]) for r in records] == [(USER, "u1", False), (POSTS, "p1", True)]
     assert statuses.count(AirbyteStreamStatus.COMPLETE) == 3
 
 
 def test_read_continues_an_in_progress_full_refresh_snapshot(requests_mock, inline_config, catalog):
-    catalog.streams[1].sync_mode = SyncMode.full_refresh  # betterAuth__user
+    catalog.streams[1].sync_mode = SyncMode.full_refresh  # betterAuth/user
     requests_mock.post(SYNC_URL, [{"json": page(cursor="c2", status={"type": "upToDate", "snapshotTs": 1})}])
-    state = [
-        stream_state(name, "c1", snapshot_complete=(name != "betterAuth__user"))
-        for name in ("posts", "betterAuth__user", "resend__rateLimiter__rateLimits")
-    ]
+    state = [stream_state(name, "c1", snapshot_complete=(name != USER)) for name in (POSTS, USER, RATE_LIMITS)]
     _, _, states, statuses = run(inline_config, catalog, state)
-    # No priming page: the previous run's re-sync of betterAuth__user is still tracked by Convex and just carries on.
+    # No priming page: the previous run's re-sync of betterAuth/user is still tracked by Convex and just carries on.
     assert len(requests_mock.request_history) == 1
     assert "betterAuth" in requests_mock.request_history[0].json()["selection"]
-    assert last_states(states)["betterAuth__user"]["snapshot_complete"] is True
+    assert last_states(states)[USER]["snapshot_complete"] is True
     assert AirbyteStreamStatus.INCOMPLETE not in statuses
 
 
@@ -442,16 +440,16 @@ def test_read_checkpoint_stamps_continue_the_incoming_sequence(requests_mock, in
     # stream's checkpoint outrank the newest one.
     requests_mock.post(SYNC_URL, [{"json": page(cursor="c9", status={"type": "upToDate", "snapshotTs": 1})}])
     state = [
-        stream_state("posts", "c8", checkpointed_at=1_788_466_011_116),
-        stream_state("betterAuth__user", "c8", checkpointed_at=1_788_466_011_116),
-        stream_state("resend__rateLimiter__rateLimits", "c8", checkpointed_at=1_788_466_011_116),
+        stream_state(POSTS, "c8", checkpointed_at=1_788_466_011_116),
+        stream_state(USER, "c8", checkpointed_at=1_788_466_011_116),
+        stream_state(RATE_LIMITS, "c8", checkpointed_at=1_788_466_011_116),
     ]
     _, _, states, _ = run(inline_config, catalog, state)
     assert {shared(s)["checkpointed_at"] for s in states} == {1_788_466_011_117}
 
 
 def test_read_resnapshots_streams_with_stale_state_without_warning(requests_mock, inline_config, catalog, caplog):
-    # betterAuth__user was disabled for a few runs (the platform kept its old state) and is enabled again.
+    # betterAuth/user was disabled for a few runs (the platform kept its old state) and is enabled again.
     requests_mock.post(
         SYNC_URL,
         [
@@ -464,9 +462,9 @@ def test_read_resnapshots_streams_with_stale_state_without_warning(requests_mock
         ],
     )
     state = [
-        stream_state("posts", "c8", checkpointed_at=8, snapshot_complete=True),
-        stream_state("betterAuth__user", "c3", checkpointed_at=3, snapshot_complete=True),
-        stream_state("resend__rateLimiter__rateLimits", "c8", checkpointed_at=8, snapshot_complete=True),
+        stream_state(POSTS, "c8", checkpointed_at=8, snapshot_complete=True),
+        stream_state(USER, "c3", checkpointed_at=3, snapshot_complete=True),
+        stream_state(RATE_LIMITS, "c8", checkpointed_at=8, snapshot_complete=True),
     ]
     with caplog.at_level(logging.WARNING):
         run(inline_config, catalog, state)
@@ -480,7 +478,7 @@ def test_read_treats_stream_whose_hint_disagrees_with_its_name_as_missing(reques
     from unit_tests.helpers import USER_SCHEMA, configured_stream
 
     # The name still resolves to root/posts, but the catalog entry was discovered as betterAuth/user.
-    catalog.streams[0] = configured_stream("posts", "betterAuth", "user", USER_SCHEMA)
+    catalog.streams[0] = configured_stream("betterAuth", "posts", USER_SCHEMA)
     requests_mock.post(SYNC_URL, [{"json": page(cursor="c1", status={"type": "upToDate", "snapshotTs": 1})}])
     messages, _, states, _ = run(inline_config, catalog)
     assert "" not in requests_mock.request_history[0].json()["selection"]
@@ -519,5 +517,5 @@ def test_read_through_the_cdk_entrypoint(requests_mock, inline_config, catalog):
     assert out.errors == []
     assert [r.record.stream for r in out.records] == ["posts"]
     assert dict(vars(out.most_recent_state.stream_state))["cursor"] == "c2"
-    checkpointed = {s.state.stream.stream_descriptor.name for s in out.state_messages}
-    assert checkpointed == {"posts", "betterAuth__user", "resend__rateLimiter__rateLimits"}
+    checkpointed = {ident(s.state.stream.stream_descriptor) for s in out.state_messages}
+    assert checkpointed == {POSTS, USER, RATE_LIMITS}
