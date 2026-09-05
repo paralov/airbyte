@@ -31,9 +31,9 @@ Every record includes the fields defined for the table plus these system fields:
 6. `_ab_cdc_lsn`, `_ab_cdc_updated_at`, and `_ab_cdc_deleted_at` follow the CDC convention used by
    database sources so destinations dedupe and delete consistently.
 
-Values that JSON cannot represent are encoded as described in the
-[Convex JSON format](https://docs.convex.dev/database/types), for example an int64 becomes
-`{"$integer": "<base64>"}`.
+Records arrive in Convex's lossless export JSON (the same encoding as snapshot exports): int64 values
+are plain numbers, while bytes become `{"$bytes": "<base64>"}` and non-finite floats become
+`{"$float": "<base64>"}`.
 
 ### Table schemas
 
@@ -46,7 +46,9 @@ path. A validator is the `.json` form of the table's `v.object({...})` from `con
 - Tables you leave out are not synced.
 - Use `null` for a table that exists without a schema. It gets a permissive stream schema (system fields
   typed, everything else allowed).
-- Int64 and bytes fields arrive in Convex's JSON encoding, for example `{"$integer": "<base64>"}`.
+- Int64 fields are typed as integers; bytes fields arrive as `{"$bytes": "<base64>"}` objects.
+- Table and component names must be valid Convex identifiers (letters, digits and underscores, at most 64
+  characters; table names cannot start with `_`). Anything else is rejected when the source is tested.
 
 To generate the object, walk your `convex.config.ts` for installed components and read every table's
 `validator.json` from each `schema.ts`. A small script that does this lives alongside your app; run it on
@@ -69,17 +71,21 @@ one. Consequences:
 - If the saved cursor does not belong to the deployment (for example after changing the deployment URL),
   the sync fails with a configuration error instead of piling a fresh snapshot onto the old rows. Clear the
   connection's data and sync again.
-- A Full Refresh stream is only complete once the sync is up to date. If "Max Pages Per Sync" stops
-  the run before that, the stream is reported incomplete (the destination keeps its previous data)
-  and the next run continues its snapshot; tombstones are never emitted into Full Refresh streams.
+- A Full Refresh stream is only complete once the sync is up to date, and Airbyte clears Full Refresh
+  state between jobs, so its snapshot has to finish within one run: "Max Pages Per Sync" is not applied
+  while Full Refresh streams are selected. If a run fails midway, the retry attempt continues the
+  snapshot. Tombstones are never emitted into Full Refresh streams.
+- The deployment URL is saved with the cursor. If it no longer matches the source configuration, the
+  sync fails with a configuration error before contacting the new deployment.
 - If Convex truncates a table (for example after `npx convex import --replace`), the connector logs
   a warning and the table is re-sent in full. Rows deleted by the truncate are not tombstoned, so
   reset that stream in the destination if you need an exact mirror.
 - A sync stops at the first page on which Convex reports the export is up to date; that page is a
   consistent snapshot of every selected table. Set "Max Pages Per Sync" to bound very large initial
   syncs; the next run resumes from the saved cursor.
-- A stream that is still in the connection but no longer in the table schemas is
-  skipped with a warning; refresh the source schema to remove it.
+- A stream that is still in the connection but no longer in the table schemas is not synced: the
+  connector logs a warning and reports that stream incomplete on every run (the other streams sync
+  normally) until you refresh the source schema and remove it.
 
 ### Features
 

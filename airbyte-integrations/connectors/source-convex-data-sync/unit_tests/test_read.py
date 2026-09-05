@@ -202,10 +202,71 @@ def test_read_all_full_refresh_still_fetches_full_selection(requests_mock, inlin
 
 def test_read_max_pages_does_not_stop_on_priming_page(requests_mock, inline_config, catalog):
     inline_config["max_pages_per_sync"] = 1
-    catalog.streams[0].sync_mode = SyncMode.full_refresh  # posts
     requests_mock.post(SYNC_URL, [{"json": page(cursor="c2")}, {"json": page(cursor="c3")}])
-    run(inline_config, catalog, global_state("c1"))
+    # resend__rateLimiter__rateLimits has no state, so it is re-synced via a priming page first.
+    run(inline_config, catalog, [stream_state("posts", "c1"), stream_state("betterAuth__user", "c1")])
     assert len(requests_mock.request_history) == 2
+
+
+def test_read_ignores_max_pages_while_a_full_refresh_snapshot_is_in_progress(requests_mock, inline_config, catalog, caplog):
+    inline_config["max_pages_per_sync"] = 1
+    catalog.streams[0].sync_mode = SyncMode.full_refresh  # posts
+    requests_mock.post(
+        SYNC_URL,
+        [
+            {"json": page(cursor="c2")},  # priming page
+            {"json": page(truncates=[{"component": "", "table": "posts"}], cursor="c3")},
+            {"json": page(cursor="c4")},
+            {"json": page(cursor="c5", status={"type": "upToDate", "snapshotTs": 1})},
+        ],
+    )
+    with caplog.at_level(logging.INFO):
+        _, _, states, statuses = run(inline_config, catalog, global_state("c1"))
+    # The platform clears full refresh state between jobs, so a snapshot cut short by the page cap would start over
+    # on every run; the run continues until the sync is up to date instead.
+    assert len(requests_mock.request_history) == 4
+    assert last_states(states)["posts"]["snapshot_complete"] is True
+    assert statuses.count(AirbyteStreamStatus.COMPLETE) == 3 and AirbyteStreamStatus.INCOMPLETE not in statuses
+    assert "max_pages_per_sync=1 is not applied" in caplog.text
+
+
+def test_read_does_not_checkpoint_when_the_priming_page_fails(requests_mock, inline_config, catalog):
+    catalog.streams[1].sync_mode = SyncMode.full_refresh  # betterAuth__user
+    requests_mock.post(SYNC_URL, [{"status_code": 403, "json": {"code": "Forbidden", "message": "missing deployment:data:view"}}])
+    emitted = []
+    with pytest.raises(AirbyteTracedException):
+        for message in SourceConvexDataSync().read(logger, inline_config, catalog, global_state("c1")):
+            emitted.append(message)
+    # The cursor never moved: persisting {cursor: c1, snapshot_complete: false} would make the next attempt skip the
+    # priming page and report the full refresh stream complete after receiving only deltas.
+    assert [m for m in emitted if m.type == Type.STATE] == []
+    statuses = [m.trace.stream_status.status for m in emitted if m.type == Type.TRACE and m.trace.stream_status]
+    assert statuses.count(AirbyteStreamStatus.INCOMPLETE) == 3
+
+
+def test_read_refuses_a_cursor_saved_for_another_deployment(requests_mock, inline_config, catalog):
+    requests_mock.post(SYNC_URL, [{"json": page(cursor="c9", status={"type": "upToDate", "snapshotTs": 1})}])
+    _, _, states, _ = run(inline_config, catalog)
+    assert {shared(s)["deployment_url"] for s in states} == {"https://murky-swan-635.convex.cloud"}
+
+    inline_config["deployment_url"] = "https://cluttered-owl-337.convex.cloud/"
+    with pytest.raises(AirbyteTracedException) as err:
+        run(inline_config, catalog, states)
+    assert err.value.failure_type == FailureType.config_error
+    assert "murky-swan-635" in err.value.message and "cluttered-owl-337" in err.value.message
+    assert len(requests_mock.request_history) == 1  # no request went to the new deployment
+
+
+def test_read_rejects_a_page_without_a_next_cursor(requests_mock, inline_config, catalog):
+    requests_mock.post(SYNC_URL, [{"json": page(cursor="c1")}, {"json": page(cursor=None)}])
+    emitted = []
+    with pytest.raises(AirbyteTracedException) as err:
+        for message in SourceConvexDataSync().read(logger, inline_config, catalog, None):
+            emitted.append(message)
+    assert "nextCursor" in err.value.message
+    # The previous good cursor is checkpointed, so the next run resumes instead of silently starting a new sync.
+    states = [m.state for m in emitted if m.type == Type.STATE]
+    assert shared(states[-1])["cursor"] == "c1"
 
 
 def test_read_resnapshots_streams_whose_state_was_cleared(requests_mock, inline_config, catalog):
@@ -376,21 +437,17 @@ def test_read_continues_an_in_progress_full_refresh_snapshot(requests_mock, inli
     assert AirbyteStreamStatus.INCOMPLETE not in statuses
 
 
-def test_read_reports_partial_full_refresh_snapshot_incomplete_at_max_pages(requests_mock, inline_config, catalog, caplog):
-    inline_config["max_pages_per_sync"] = 1
-    catalog.streams[0].sync_mode = SyncMode.full_refresh  # posts
-    requests_mock.post(SYNC_URL, [{"json": page(cursor="c1")}, {"json": page(cursor="c2")}])
-    with caplog.at_level(logging.WARNING):
-        messages, _, states, _ = run(inline_config, catalog)
-    final = {
-        m.trace.stream_status.stream_descriptor.name: m.trace.stream_status.status
-        for m in messages
-        if m.type == Type.TRACE and m.trace.stream_status
-    }
-    assert final["posts"] == AirbyteStreamStatus.INCOMPLETE
-    assert final["betterAuth__user"] == AirbyteStreamStatus.COMPLETE
-    assert last_states(states)["posts"]["snapshot_complete"] is False
-    assert "full refresh snapshot of ['posts']" in caplog.text
+def test_read_checkpoint_stamps_continue_the_incoming_sequence(requests_mock, inline_config, catalog):
+    # The stamp is a logical sequence, not wall-clock time, so a worker whose clock runs ahead can never make a stale
+    # stream's checkpoint outrank the newest one.
+    requests_mock.post(SYNC_URL, [{"json": page(cursor="c9", status={"type": "upToDate", "snapshotTs": 1})}])
+    state = [
+        stream_state("posts", "c8", checkpointed_at=1_788_466_011_116),
+        stream_state("betterAuth__user", "c8", checkpointed_at=1_788_466_011_116),
+        stream_state("resend__rateLimiter__rateLimits", "c8", checkpointed_at=1_788_466_011_116),
+    ]
+    _, _, states, _ = run(inline_config, catalog, state)
+    assert {shared(s)["checkpointed_at"] for s in states} == {1_788_466_011_117}
 
 
 def test_read_resnapshots_streams_with_stale_state_without_warning(requests_mock, inline_config, catalog, caplog):
@@ -443,5 +500,24 @@ def test_read_does_not_retry_a_malformed_deployment_url(inline_config, catalog, 
     with pytest.raises(AirbyteTracedException) as err:
         run(inline_config, catalog)
     assert err.value.failure_type == FailureType.config_error
-    assert "No scheme supplied" in err.value.message
+    assert "InvalidDeploymentUrl" in err.value.message
     assert sleeps == []
+
+
+def test_read_through_the_cdk_entrypoint(requests_mock, inline_config, catalog):
+    # Drives one sync through AirbyteEntrypoint so the state blobs and records are actually serialised and counted.
+    from airbyte_cdk.test.entrypoint_wrapper import read as entrypoint_read
+
+    requests_mock.post(
+        SYNC_URL,
+        [
+            {"json": page(values=[value("", "posts", {"_id": "p1", "_creationTime": 1.0, "author": "u1", "body": "hi"})], cursor="c1")},
+            {"json": page(cursor="c2", status={"type": "upToDate", "snapshotTs": 1})},
+        ],
+    )
+    out = entrypoint_read(SourceConvexDataSync(), inline_config, catalog, None)
+    assert out.errors == []
+    assert [r.record.stream for r in out.records] == ["posts"]
+    assert dict(vars(out.most_recent_state.stream_state))["cursor"] == "c2"
+    checkpointed = {s.state.stream.stream_descriptor.name for s in out.state_messages}
+    assert checkpointed == {"posts", "betterAuth__user", "resend__rateLimiter__rateLimits"}

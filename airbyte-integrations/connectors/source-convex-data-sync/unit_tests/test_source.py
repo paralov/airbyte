@@ -14,7 +14,7 @@ from source_convex_data_sync.source import (
     validator_to_json_schema,
 )
 
-from airbyte_cdk.models import SyncMode
+from airbyte_cdk.models import Status, SyncMode
 from airbyte_cdk.utils.traced_exception import AirbyteTracedException
 from unit_tests.helpers import ACTIVE_SYNCS_URL, POSTS_VALIDATOR, SCHEMA, USER_VALIDATOR, obj
 
@@ -53,9 +53,10 @@ def test_parse_schema_json_null_marks_schemaless_table():
     assert parsed == {("", "scratch"): None}
 
 
-def test_parse_schema_json_rejects_flat_form_with_hint():
+@pytest.mark.parametrize("validator", [POSTS_VALIDATOR, {"type": "string"}, {"type": "id", "tableName": "users"}])
+def test_parse_schema_json_rejects_flat_form_with_hint(validator):
     with pytest.raises(AirbyteTracedException) as err:
-        parse_schema_json(json.dumps({"posts": POSTS_VALIDATOR}))
+        parse_schema_json(json.dumps({"posts": validator}))
     assert '{"": {"posts": <validator>}}' in err.value.message
 
 
@@ -65,6 +66,28 @@ def test_parse_schema_json_rejects_bad_input(bad):
         parse_schema_json(bad)
 
 
+@pytest.mark.parametrize(
+    "schema, needle",
+    [
+        ({"": {"user-profiles": None}}, "'user-profiles' is not a valid Convex table name"),
+        ({"": {"_private": None}}, "'_private' is not a valid Convex table name"),
+        ({"": {"x" * 65: None}}, "is not a valid Convex table name"),
+        ({"better-auth": {"user": None}}, "'better-auth' is not a valid Convex component path"),
+        ({"resend/": {"user": None}}, "'resend/' is not a valid Convex component path"),
+    ],
+)
+def test_parse_schema_json_rejects_names_convex_would_refuse(schema, needle):
+    with pytest.raises(AirbyteTracedException) as err:
+        parse_schema_json(json.dumps(schema))
+    assert needle in err.value.message
+    assert err.value.failure_type.value == "config_error"
+
+
+def test_parse_schema_json_accepts_identifiers_with_underscores():
+    parsed = parse_schema_json(json.dumps({"_internal/_sub": {"audit_log2": None}}))
+    assert parsed == {("_internal/_sub", "audit_log2"): None}
+
+
 def test_validator_to_json_schema_covers_every_validator_kind():
     validator = obj(
         {
@@ -72,6 +95,7 @@ def test_validator_to_json_schema_covers_every_validator_kind():
             "n": ({"type": "number"}, False),
             "b": ({"type": "boolean"}, True),
             "big": ({"type": "bigint"}, False),
+            "committed": ({"type": "commitTs"}, False),
             "bytes": ({"type": "bytes"}, False),
             "nil": ({"type": "null"}, False),
             "anything": ({"type": "any"}, False),
@@ -88,17 +112,21 @@ def test_validator_to_json_schema_covers_every_validator_kind():
     assert p["s"] == {"type": "string"}
     assert p["n"]["anyOf"][0] == {"type": "number"}
     assert p["b"] == {"type": "boolean"} and "b" not in schema["required"]
-    assert p["big"]["properties"] == {"$integer": {"type": "string"}}
+    # The data sync endpoint's export JSON ships int64 as a plain number; only bytes and non-finite floats are wrapped.
+    assert p["big"] == {"type": "integer"}
+    assert p["committed"] == {"type": "integer"}
     assert p["bytes"]["properties"] == {"$bytes": {"type": "string"}}
     assert p["nil"] == {"type": "null"}
     assert p["anything"] == {}
     assert p["lit"] == {"type": "string", "enum": ["open"]}
     assert p["ref"] == {"type": "string", "$description": "Id(users)"}
     assert p["list"] == {"type": "array", "items": {"type": "string"}}
-    assert p["map"]["additionalProperties"]["anyOf"][0] == {"type": "number"}
+    assert p["map"] == {"type": "object", "additionalProperties": True}
     assert p["either"] == {"anyOf": [{"type": "string"}, {"type": "null"}]}
     assert p["nested"]["properties"]["x"]["anyOf"][0] == {"type": "number"}
-    assert schema["additionalProperties"] is False
+    # Airbyte requires every additionalProperties in a stream schema to be true, so nested objects never set it to false.
+    assert "additionalProperties" not in schema
+    assert "additionalProperties" not in p["nested"]
 
 
 def test_validator_to_json_schema_rejects_unknown_kind():
@@ -111,7 +139,8 @@ def test_check_connection_ok(requests_mock, inline_config):
     ok, error = SourceConvexDataSync().check_connection(logger, inline_config)
     assert ok and error is None
     assert requests_mock.last_request.headers["Authorization"] == "Convex test_api_key"
-    assert requests_mock.last_request.headers["Convex-Client"].startswith("airbyte-data-sync-")
+    # convex-backend only attributes syncs to Airbyte for the "airbyte-export" client name.
+    assert requests_mock.last_request.headers["Convex-Client"].startswith("airbyte-export-")
 
 
 def test_check_connection_bad_key(requests_mock, inline_config):
@@ -119,6 +148,27 @@ def test_check_connection_bad_key(requests_mock, inline_config):
     ok, error = SourceConvexDataSync().check_connection(logger, inline_config)
     assert not ok
     assert "Unauthenticated" in error and "bad key" in error
+
+
+def test_check_reports_the_failure_message_unquoted(requests_mock, inline_config):
+    # AbstractSource.check would wrap the reason in repr(), showing the user a quoted, escaped string.
+    requests_mock.get(ACTIVE_SYNCS_URL, status_code=401, json={"code": "Unauthenticated", "message": "bad 'key'"})
+    status = SourceConvexDataSync().check(logger, inline_config)
+    assert status.status == Status.FAILED
+    assert status.message == "Listing active data syncs: 401: Unauthenticated: bad 'key'"
+    requests_mock.get(ACTIVE_SYNCS_URL, json={"syncs": [], "pagination": {"hasMore": False}})
+    assert SourceConvexDataSync().check(logger, inline_config).status == Status.SUCCEEDED
+
+
+def test_check_connection_gives_up_quickly_on_outages(requests_mock, inline_config, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("source_convex_data_sync.source.time.sleep", sleeps.append)
+    requests_mock.get(ACTIVE_SYNCS_URL, status_code=503, text="down", headers={"Retry-After": "60"})
+    ok, error = SourceConvexDataSync().check_connection(logger, inline_config)
+    assert not ok and "503" in error
+    # A connection check retries once instead of sitting through the sync path's full backoff schedule.
+    assert len(requests_mock.request_history) == 2
+    assert sleeps == [60.0]
 
 
 @pytest.mark.parametrize("response", [{"json": "Unauthorized"}, {"json": ["nope"]}, {"text": "<html>gateway</html>"}])
@@ -196,13 +246,10 @@ def test_check_connection_reports_colliding_stream_names(requests_mock):
     assert not ok and "audit__log" in error
 
 
-def test_check_connection_rejects_malformed_deployment_url(inline_config, monkeypatch):
-    sleeps = []
-    monkeypatch.setattr("source_convex_data_sync.source.time.sleep", sleeps.append)
+def test_check_connection_rejects_malformed_deployment_url(inline_config):
     inline_config["deployment_url"] = "murky-swan-635.convex.cloud"
     ok, error = SourceConvexDataSync().check_connection(logger, inline_config)
-    assert not ok and "No scheme supplied" in error
-    assert sleeps == []
+    assert not ok and "InvalidDeploymentUrl" in error
 
 
 def test_discover_catalog(inline_config):
