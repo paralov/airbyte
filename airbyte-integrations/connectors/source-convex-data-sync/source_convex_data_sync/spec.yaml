@@ -1,0 +1,59 @@
+documentationUrl: https://docs.airbyte.com/integrations/sources/convex-data-sync
+connectionSpecification:
+  additionalProperties: true
+  $schema: http://json-schema.org/draft-07/schema#
+  title: Convex Data Sync Source Spec
+  type: object
+  required:
+    - deployment_url
+    - access_key
+    - schema_json
+  properties:
+    deployment_url:
+      type: string
+      title: Deployment URL
+      description: The deployment's URL, from the Settings tab of the Convex dashboard.
+      order: 0
+      examples:
+        - https://murky-swan-635.convex.cloud
+        - https://cluttered-owl-337.convex.cloud
+    access_key:
+      type: string
+      title: Deploy Key
+      description: A deploy key with the deployment:data:view permission. Streaming export requires a Convex Pro plan.
+      airbyte_secret: true
+      order: 1
+    schema_json:
+      type: string
+      title: Table Schemas (Convex validator JSON)
+      description: >-
+        Which tables to sync and their schemas, as {"<component path>": {"<table>": <Convex validator JSON> | null}}
+        with "" for the root component. A validator is the .json form of v.object({...}) from convex/values, the
+        same thing npx convex dev pushes to your deployment. Use null for a table without a schema. Generate this
+        from your convex.config.ts and schema.ts files; see the connector documentation.
+      multiline: true
+      order: 2
+    max_pages_per_sync:
+      type: integer
+      title: Max Pages Per Sync
+      description: >-
+        Stop after this many data sync pages and checkpoint; the next sync resumes from the saved cursor.
+        0 means run until the sync is up to date. Ignored when Full Refresh streams are selected,
+        because their buffered snapshot must finish before records can be emitted.
+      default: 0
+      minimum: 0
+      order: 3
+    state_checkpoint_pages:
+      type: integer
+      title: State Checkpoint Interval (pages)
+      description: Emit a state message after this many pages.
+      default: 25
+      minimum: 1
+      order: 4
+    request_timeout_seconds:
+      type: integer
+      title: Request Timeout (seconds)
+      description: How long to wait for one deployment API request before retrying it.
+      default: 120
+      minimum: 5
+      order: 5
